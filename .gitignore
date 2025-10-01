@@ -1,0 +1,28 @@
+# Build directory
+build/
+cmake-build-*/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Compiled files
+*.o
+*.elf
+*.bin
+*.hex
+*.uf2
+*.dis
+*.map
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# OS files
+.DS_Store
+Thumbs.db
