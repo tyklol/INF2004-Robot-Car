@@ -1,0 +1,10 @@
+{
+    "files.associations": {
+        "*.embeddedhtml": "html",
+        "motor.h": "c",
+        "adc.h": "c",
+        "ir.h": "c",
+        "gpio.h": "c",
+        "stdio.h": "c"
+    }
+}
