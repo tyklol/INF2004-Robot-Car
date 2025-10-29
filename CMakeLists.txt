@@ -20,6 +20,12 @@ add_executable(${CMAKE_PROJECT_NAME}
     main.c
 )
 
+target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE
+    WIFI_SSID=\"${WIFI_SSID}\"
+    WIFI_PASSWORD=\"${WIFI_PASSWORD}\"
+    MQTT_SERVER=\"${MQTT_SERVER}\"
+)
+
 # --- Link all required libraries ---
 # We link our main executable against the "car_drivers" library.
 # CMake is smart enough to also link all the SDK libraries 

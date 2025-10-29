@@ -4,6 +4,7 @@
 #include "drivers/motor.h"
 // #include "drivers/ir.h" // Original include
 #include "drivers/ir.c"   // UPDATED INCLUDE PATH AS REQUESTED
+#include "drivers/mqtt_client.h"
 
 // --- Pin Definitions for Buttons ---
 #define BUTTON_MODE_DUAL    21  // GP21
@@ -13,6 +14,7 @@
 #define DEBOUNCE_TIME_US    150000 // 150 milliseconds
 #define BASE_SPEED_PERCENT  25.0f  // Keep slow for tuning
 #define PRINT_DELAY_MS      100    // Print values every 100ms
+#define TEMP_PUBLISH_INTERVAL_MS 10000u // 10 seconds
 
 // --- State Machine ---
 typedef enum {
@@ -48,12 +50,24 @@ void gpio_interrupt_handler(uint gpio, uint32_t events) {
 // Main application entry point
 int main() {
     stdio_init_all();
-    sleep_ms(2000);
+    sleep_ms(5000);
     printf("Robotic Car Program Started!\n");
+
+    printf("WIFI_SSID: %s\n", WIFI_SSID);
+    printf("WIFI_PASSWORD: %s\n", WIFI_PASSWORD);
+    printf("MQTT_SERVER: %s\n", MQTT_SERVER);
 
     printf("Initializing drivers...\n");
     motor_init();
     ir_init();
+    // Uncomment to test out MQTT
+    // static MQTT_CLIENT_DATA_T state;
+    // mqtt_client_init(&state);
+    // while (!mqtt_client_try_wifi_connect(&state, 10000)) {
+    //     printf("WiFi connection failed, retrying...\n");
+    //     sleep_ms(2000);
+    // }
+    // mqtt_client_start_mqtt(&state); // start DNS / mqtt
     printf("Drivers initialized.\n");
 
     // --- setup buttons ---
@@ -83,7 +97,7 @@ int main() {
     const char *current_ir_state = "IDLE";
     uint32_t last_print_time = 0;
     // ----------------------------------------
-
+    uint32_t last_temp_publish_ms = to_ms_since_boot(get_absolute_time());
     // --- Main Program Loop ---
     while (true) {
 
@@ -141,6 +155,13 @@ int main() {
             last_print_time = now_ms;
         }
 
+        // mqtt_client_poll(&state);
+        // // Only publish temperature at most once per interval and only when MQTT is online
+        // uint32_t now_ms2 = to_ms_since_boot(get_absolute_time());
+        // if (mqtt_client_is_online(&state) && (now_ms2 - last_temp_publish_ms >= TEMP_PUBLISH_INTERVAL_MS)) {
+        //     last_temp_publish_ms = now_ms2;
+        //     mqtt_client_publish_temperature(&state);
+        // }
         sleep_ms(5);
     }
 }
