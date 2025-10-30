@@ -7,6 +7,11 @@ MQTT_SERVER <your IPV4 Address>
 
 Download MQTT from https://mosquitto.org/download/
 (I selected mosquitto-2.0.22-install-windows-x64.exe under Windows)
+
+Add this path to your environment variable:
+C:\Program Files\mosquitto
+Go to Environment Variables -> System variables -> Edit Path -> Add "C:\Program Files\mosquitto"
+
 Go find mosquitto.conf (mine was at C:\Program Files\mosquitto\mosquitto.conf) and add the following line to the file:
 listener 1883
 allow_anonymous true
@@ -22,7 +27,7 @@ Output should be something like this if MQTT accepts connections from any IP:
 TCP    0.0.0.0:1883           0.0.0.0:0              LISTENING       33608
 TCP    [::]:1883              [::]:0                 LISTENING       33608
 
-If firewall is fucking with the MQTT, type in the following command:
+Type in the following command in an Admin Command Prompt to prevent firewall from fucking with MQTT:
 netsh advfirewall firewall add rule name="Mosquitto MQTT" dir=in action=allow protocol=TCP localport=1883
 
 Open a command prompt and type in the following command to see any message being published to MQTT:
