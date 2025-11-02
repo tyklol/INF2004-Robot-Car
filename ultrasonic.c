@@ -45,20 +45,26 @@ uint64_t getInch(uint trigPin, uint echoPin) {
     uint64_t pulseLength = getPulse(trigPin, echoPin);
     return pulseLength / 74 / 2;
 }
+int checkDest(){
+    int trigPin = 0;
+    int echoPin = 1;
+    //Ultra
+    setupUltrasonicPins(trigPin, echoPin);
+    int distanceCM = (int)getCm(trigPin, echoPin);
+    printf("Distance: %d cm\n", distanceCM);
+    return distanceCM;
+}
 
 int main() {
     stdio_init_all();
     sleep_ms(2000);
 
     printf("Ultrasonic test starting...\n");
-    int trigPin = 0;
-    int echoPin = 1;
+     while (true) {
+        int dist = checkDest();
 
-    setupUltrasonicPins(trigPin, echoPin);
-
-    while (true) {
-        int distanceCM = (int)getCm(trigPin, echoPin);
-        printf("Distance: %d cm\n", distanceCM);
-        sleep_ms(1000);
+        if(dist <=15){
+            printf("Object detected\n");
+            //insert code to stop car 
     }
 }
