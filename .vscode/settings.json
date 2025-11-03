@@ -5,6 +5,10 @@
         "adc.h": "c",
         "ir.h": "c",
         "gpio.h": "c",
-        "stdio.h": "c"
+        "stdio.h": "c",
+        "math.h": "c",
+        "mqtt.h": "c",
+        "irq.h": "c",
+        "encoder.h": "c"
     }
 }

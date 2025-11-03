@@ -12,7 +12,7 @@
 #include <ctype.h>
 #include <math.h>
 
-#include "mqtt_client.h"
+#include "mqtt.h"
 
 // Temperature
 #ifndef TEMPERATURE_UNITS
@@ -268,9 +268,9 @@ void mqtt_client_init(MQTT_CLIENT_DATA_T *client_data) {
 
     adc_set_temp_sensor_enabled(true);
 
-    if (cyw43_arch_init()) {
-        panic("Failed to initialize CYW43");
-    }
+    // if (cyw43_arch_init()) {
+    //     panic("Failed to initialize CYW43");
+    // }
 
     /* generate client id: MQTT_DEVICE_NAME + board unique id */
     char unique_id_buf[5];
