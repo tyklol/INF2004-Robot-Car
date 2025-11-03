@@ -31,13 +31,14 @@ target_link_libraries(car_drivers
     hardware_i2c     # For IMU (future)
     hardware_adc     # For IR sensors
     hardware_timer   # For ultrasonic (future)
-    pico_cyw43_arch_lwip_threadsafe_background
+    # pico_cyw43_arch_lwip_threadsafe_background
+    pico_cyw43_arch_lwip_sys_freertos
     pico_lwip_mqtt
     pico_mbedtls
     pico_lwip_mbedtls
     hardware_sync
+    FreeRTOS-Kernel-Heap4
 )
-
 # ----- MOVE all the credential logic (WIFI_SSID, etc.) to your ROOT CMakeLists.txt -----
 # ----- We still need the definitions for the C code in this library -----
 
@@ -45,4 +46,5 @@ target_compile_definitions(car_drivers PRIVATE
     WIFI_SSID=\"${WIFI_SSID}\"
     WIFI_PASSWORD=\"${WIFI_PASSWORD}\"
     MQTT_SERVER=\"${MQTT_SERVER}\"
+    NO_SYS=0
 )

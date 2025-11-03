@@ -21,5 +21,7 @@
 #define LWIP_SO_RCVTIMEO 1
 #endif
 
-
+#ifndef MEMP_NUM_SYS_TIMEOUT
+#define MEMP_NUM_SYS_TIMEOUT 12
+#endif
 #endif

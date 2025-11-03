@@ -51,6 +51,7 @@ target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE
     WIFI_SSID=\"${WIFI_SSID}\"
     WIFI_PASSWORD=\"${WIFI_PASSWORD}\"
     MQTT_SERVER=\"${MQTT_SERVER}\"
+    NO_SYS=0
 )
 
 

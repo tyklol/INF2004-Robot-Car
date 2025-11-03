@@ -9,6 +9,9 @@
         "math.h": "c",
         "mqtt.h": "c",
         "irq.h": "c",
-        "encoder.h": "c"
+        "encoder.h": "c",
+        "freertos.h": "c",
+        "altcp_tls.h": "c",
+        "cyw43_arch.h": "c"
     }
 }
