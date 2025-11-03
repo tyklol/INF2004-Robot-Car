@@ -24,7 +24,7 @@ set(MQTT_SERVER "${MQTT_SERVER}" CACHE INTERNAL "MQTT server for examples")
 
 
 # Find and initialize the Pico SDK
-include($ENV{PICO_SDK_PATH}/pico_sdk_init.cmake)
+include($ENV{PICO_SDK_PATH}/pico-sdk/pico_sdk_init.cmake)
 
 project(robotic_car_firmware C CXX ASM)
 set(PICO_BOARD "pico_w")

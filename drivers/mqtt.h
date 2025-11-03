@@ -36,6 +36,8 @@ typedef struct {
  * Call mqtt_client_try_wifi_connect() and mqtt_client_start_mqtt()
  * when you want to connect.
  */
+// In your mqtt.h (or similar)
+void mqtt_client_publish_debug_data(MQTT_CLIENT_DATA_T *state, float target_L, float current_L, float power_L, float target_R, float current_R, float power_R, uint16_t sensor_adc, float sensor_norm);
 void mqtt_client_init(MQTT_CLIENT_DATA_T *client_data);
 
 /* Blocking attempt to connect to WiFi (returns true on success). */

@@ -118,7 +118,38 @@ static void control_led(MQTT_CLIENT_DATA_T *state, bool on) {
     cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, on ? 1 : 0);
     mqtt_publish(state->mqtt_client_inst, full_topic(state, "/led/state"), message, strlen(message), MQTT_PUBLISH_QOS, MQTT_PUBLISH_RETAIN, pub_request_cb, state);
 }
+void mqtt_client_publish_debug_data(MQTT_CLIENT_DATA_T *state, 
+                                    float target_L, float current_L, float power_L, 
+                                    float target_R, float current_R, float power_R, 
+                                    uint16_t sensor_adc, float sensor_norm) 
+{
+    // 1. Check if the client is connected
+    if (!mqtt_client_is_online(state)) {
+        return;
+    }
 
+    // 2. Format the JSON payload
+    char buffer[256];
+    snprintf(buffer, sizeof(buffer),
+             "{\"tgt_L\":%.1f, \"cur_L\":%.1f, \"pwr_L\":%.1f, \"tgt_R\":%.1f, \"cur_R\":%.1f, \"pwr_R\":%.1f, \"adc\":%u, \"norm\":%.2f}",
+             target_L, current_L, power_L,
+             target_R, current_R, power_R,
+             sensor_adc, sensor_norm);
+
+    // 3. Publish the message (thread-safe)
+    // We must use the lwip_begin/lwip_end guards because this function
+    // will be called from main_control_task, not the network_task.
+    cyw43_arch_lwip_begin();
+    mqtt_publish(state->mqtt_client_inst, 
+                 "robot/debug/line", 
+                 buffer, 
+                 strlen(buffer), 
+                 MQTT_PUBLISH_QOS, 
+                 MQTT_PUBLISH_RETAIN, 
+                 pub_request_cb, 
+                 state);
+    cyw43_arch_lwip_end();
+}
 /* publish_temperature internal (kept static) */
 static void publish_temperature_internal(MQTT_CLIENT_DATA_T *state) {
     static float old_temperature;
