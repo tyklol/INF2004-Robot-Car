@@ -14,7 +14,7 @@
 #include "drivers/ir.h"
 #include "drivers/encoder.h"     // <-- Includes new polling function
 #include "drivers/mqtt.h"
-
+#include "mqtt_test.c" // For WIFI_SSID, WIFI_PASSWORD, MQTT_SERVER
 // --- Pin Definitions for Buttons ---
 #define BUTTON_MODE_CALIBRATE  21 // GP21 (Calibration Step)
 #define BUTTON_MODE_START_STOP 20 // GP20 (Line Follow Toggle)
@@ -332,7 +332,7 @@ void network_task(__unused void *params) {
     
     mqtt_client_start_mqtt(&mqtt_state);
     uint32_t last_temp_publish_ms = to_ms_since_boot(get_absolute_time());
-
+    printf("MQTT connected and started. About to enter for loop.\n");
     for (;;) {
         mqtt_client_poll(&mqtt_state); 
         uint32_t now_ms = to_ms_since_boot(get_absolute_time());

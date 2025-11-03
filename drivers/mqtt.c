@@ -85,7 +85,7 @@ static float read_onboard_temperature(const char unit) {
     float voltage = (float)raw * conversionFactor;
 
     // DEBUG: print raw + voltage once in a while or during development
-    printf("ADC raw=%d voltage=%.3fV\n", raw, voltage);
+    // printf("ADC raw=%d voltage=%.3fV\n", raw, voltage);
 
     float tempC = 27.0f - (voltage - 0.706f) / 0.001721f;
 
@@ -129,17 +129,22 @@ static void publish_temperature_internal(MQTT_CLIENT_DATA_T *state) {
     const float THRESHOLD = 0.2f;
     if (isnan(old_temperature) || fabsf(temperature - old_temperature) > THRESHOLD) {
         old_temperature = temperature;
-        char temp_str[16];
-        snprintf(temp_str, sizeof(temp_str), "%.2f", temperature);
-        printf("Publishing %s to %s\n", temp_str, temperature_key);
-        mqtt_publish(state->mqtt_client_inst, temperature_key, temp_str, strlen(temp_str), MQTT_PUBLISH_QOS, MQTT_PUBLISH_RETAIN, pub_request_cb, state);
+
+        char payload[128];
+        int len = snprintf(payload, sizeof(payload), "{\"temp_c\": %.2f}", temperature);
+        if (len < 0) len = 0;
+        if (len >= (int)sizeof(payload)) len = sizeof(payload) - 1;
+        payload[len] = '\0';
+        mqtt_publish(state->mqtt_client_inst, temperature_key, payload, strlen(payload), MQTT_PUBLISH_QOS, MQTT_PUBLISH_RETAIN, pub_request_cb, state);
+        printf("Publishing %s to %s\n", payload, temperature_key);
     }
 }
 
 static void sub_request_cb(void *arg, err_t err) {
     MQTT_CLIENT_DATA_T* state = (MQTT_CLIENT_DATA_T*)arg;
     if (err != 0) {
-        panic("subscribe request failed %d", err);
+        ERROR_printf("subscribe request failed: %d\n", err);
+        return;
     }
     state->subscribe_count++;
 }
@@ -147,10 +152,14 @@ static void sub_request_cb(void *arg, err_t err) {
 static void unsub_request_cb(void *arg, err_t err) {
     MQTT_CLIENT_DATA_T* state = (MQTT_CLIENT_DATA_T*)arg;
     if (err != 0) {
-        panic("unsubscribe request failed %d", err);
+        ERROR_printf("unsubscribe request failed: %d\n", err);
+        return;
     }
     state->subscribe_count--;
-    assert(state->subscribe_count >= 0);
+    if (state->subscribe_count < 0) {
+        ERROR_printf("unsubscribe resulted in negative subscribe_count (%d)\n", state->subscribe_count);
+        state->subscribe_count = 0;
+    }
 
     if (state->subscribe_count <= 0 && state->stop_client) {
         mqtt_disconnect(state->mqtt_client_inst);
@@ -210,51 +219,97 @@ static void mqtt_connection_cb(mqtt_client_t *client, void *arg, mqtt_connection
         }
     } else if (status == MQTT_CONNECT_DISCONNECTED) {
         if (!state->connect_done) {
-            panic("Failed to connect to mqtt server");
+            ERROR_printf("MQTT disconnected before initial connect completed\n");
+            state->connect_done = false;
+        } else {
+            INFO_printf("MQTT disconnected\n");
+            state->connect_done = false;
         }
     } else {
-        panic("Unexpected mqtt status");
+        ERROR_printf("Unexpected mqtt status: %d\n", status);
+        state->connect_done = false;
     }
 }
 
-static void start_client(MQTT_CLIENT_DATA_T *state) {
-    printf("Reached start_client...\n");
+static int start_client(MQTT_CLIENT_DATA_T *state) {
 #if LWIP_ALTCP && LWIP_ALTCP_TLS
     const int port = MQTT_TLS_PORT;
-    printf("Using TLS\n");
+    INFO_printf("Using TLS\n");
 #else
     const int port = MQTT_PORT;
-    printf("Warning: Not using TLS\n");
+    INFO_printf("Warning: Not using TLS\n");
 #endif
+
+    /* Prevent creating a second client instance without cleaning up the first */
+    if (state->mqtt_client_inst) {
+        ERROR_printf("start_client: mqtt_client_inst already exists\n");
+        return ERR_USE;
+    }
 
     state->mqtt_client_inst = mqtt_client_new();
     if (!state->mqtt_client_inst) {
-        panic("MQTT client instance creation error");
+        ERROR_printf("MQTT client instance creation error\n");
+        return ERR_MEM;
     }
-    printf("IP address of this device %s\n", ipaddr_ntoa(&(netif_list->ip_addr)));
-    printf("Connecting to mqtt server at %s\n", ipaddr_ntoa(&state->mqtt_server_address));
+
+    INFO_printf("IP address of this device %s\n", ipaddr_ntoa(&(netif_list->ip_addr)));
+    INFO_printf("Connecting to mqtt server at %s\n", ipaddr_ntoa(&state->mqtt_server_address));
 
     cyw43_arch_lwip_begin();
-    if (mqtt_client_connect(state->mqtt_client_inst, &state->mqtt_server_address, port, mqtt_connection_cb, state, &state->mqtt_client_info) != ERR_OK) {
-        panic("MQTT broker connection error");
+    int err = mqtt_client_connect(state->mqtt_client_inst,
+        &state->mqtt_server_address, port, mqtt_connection_cb, state, &state->mqtt_client_info);
+    cyw43_arch_lwip_end();
+
+    if (err != ERR_OK) {
+        ERROR_printf("MQTT broker connection error: %d\n", err);
+        /* Attempt to cleanly disconnect/free the partially created client */
+        cyw43_arch_lwip_begin();
+        mqtt_disconnect(state->mqtt_client_inst);
+        cyw43_arch_lwip_end();
+        state->mqtt_client_inst = NULL;
+        state->connect_done = false;
+        return err;
     }
+
+    printf("MQTT connection initiated...\n");
 #if LWIP_ALTCP && LWIP_ALTCP_TLS
     mbedtls_ssl_set_hostname(altcp_tls_context(state->mqtt_client_inst->conn), MQTT_SERVER);
 #endif
+
+    cyw43_arch_lwip_begin();
     mqtt_set_inpub_callback(state->mqtt_client_inst, mqtt_incoming_publish_cb, mqtt_incoming_data_cb, state);
     cyw43_arch_lwip_end();
+
+    return ERR_OK;
 }
 
 /* DNS callback used by mqtt_client_start_mqtt() */
 static void dns_found(const char *hostname, const ip_addr_t *ipaddr, void *arg) {
-    printf("Reached dns_found...\n");
     MQTT_CLIENT_DATA_T *state = (MQTT_CLIENT_DATA_T*)arg;
     if (ipaddr) {
         state->mqtt_server_address = *ipaddr;
-        printf("Going into start_client...\n");
-        start_client(state);
+
+        /* If an existing client instance is present, ensure it is cleaned up
+         * before we attempt to start a new one.
+         */
+        if (state->mqtt_client_inst && !mqtt_client_is_connected(state->mqtt_client_inst)) {
+            INFO_printf("dns_found: cleaning up previous mqtt_client_inst before restart\n");
+            cyw43_arch_lwip_begin();
+            mqtt_disconnect(state->mqtt_client_inst);
+            cyw43_arch_lwip_end();
+            state->mqtt_client_inst = NULL;
+            state->connect_done = false;
+            state->subscribe_count = 0;
+        }
+
+        int rc = start_client(state);
+        if (rc != ERR_OK) {
+            ERROR_printf("start_client failed after DNS for %s: %d\n", hostname ? hostname : "(null)", rc);
+            state->connect_done = false; // ensure state reflects not connected
+        }
     } else {
-        panic("dns request failed");
+        ERROR_printf("DNS resolution failed for %s\n", hostname ? hostname : "(null)");
+        state->connect_done = false;
     }
 }
 
@@ -269,7 +324,9 @@ void mqtt_client_init(MQTT_CLIENT_DATA_T *client_data) {
     adc_set_temp_sensor_enabled(true);
 
     // if (cyw43_arch_init()) {
-    //     panic("Failed to initialize CYW43");
+    //     ERROR_printf("Failed to initialize CYW43\n");
+    //     client_data->initialized = false;
+    //     return;
     // }
 
     /* generate client id: MQTT_DEVICE_NAME + board unique id */
@@ -329,25 +386,29 @@ bool mqtt_client_try_wifi_connect(MQTT_CLIENT_DATA_T *client_data, uint32_t time
 
 /* Start MQTT connection (performs DNS lookup). Non-blocking DNS via callback. */
 int mqtt_client_start_mqtt(MQTT_CLIENT_DATA_T *client_data) {
-    printf("Starting MQTT client...\n");
-    if (!client_data || !client_data->initialized) return -1;
-    printf("Resolving MQTT server hostname %s...\n", MQTT_SERVER);
+    if (!client_data || !client_data->initialized) return ERR_VAL;
+
     cyw43_arch_lwip_begin();
     int err = dns_gethostbyname(MQTT_SERVER, &client_data->mqtt_server_address, dns_found, client_data);
-    printf("DNS lookup %s\n", (err == ERR_OK) ? "succeeded" : "failed");
     cyw43_arch_lwip_end();
 
     if (err == ERR_OK) {
-        /* start_client() has already been invoked synchronously */
-        start_client(client_data);
+        // DNS resolved synchronously; start_client should be invoked now.
+        // Call start_client explicitly to ensure consistent behaviour and capture its return value.
+        int rc = start_client(client_data);
+        if (rc != ERR_OK) {
+            ERROR_printf("mqtt_client_start_mqtt: start_client returned %d\n", rc);
+            return rc;
+        }
+        return ERR_OK;
     } else if (err == ERR_INPROGRESS) {
-        /* DNS in progress, dns_found() will call start_client() */
-        panic("DNS in progress - should not happen");
+        // DNS will complete asynchronously via dns_found()
+        INFO_printf("mqtt_client_start_mqtt: DNS lookup in progress\n");
+        return ERR_INPROGRESS;
     } else {
-        /* error */
-        panic("DNS request error");
+        ERROR_printf("mqtt_client_start_mqtt: dns_gethostbyname failed immediately: %d\n", err);
+        return err;
     }
-    return err;
 }
 
 /* Poll function: call from main loop to let cyw43/lwip do background work. */
@@ -376,9 +437,31 @@ void mqtt_client_subscribe(MQTT_CLIENT_DATA_T *client_data, const char *topic) {
 }
 
 void mqtt_client_disconnect(MQTT_CLIENT_DATA_T *client_data) {
-    if (!client_data || !client_data->mqtt_client_inst) return;
+    if (!client_data) return;
+
+    /* If no client instance, just clear flags */
+    if (!client_data->mqtt_client_inst) {
+        client_data->stop_client = true;
+        client_data->connect_done = false;
+        client_data->subscribe_count = 0;
+        return;
+    }
+
+    /* Request graceful disconnect and clear local state.
+     * mqtt_disconnect must be called while lwIP is active.
+     */
     client_data->stop_client = true;
-    sub_unsub_topics(client_data, false);
+    cyw43_arch_lwip_begin();
+    mqtt_disconnect(client_data->mqtt_client_inst);
+    cyw43_arch_lwip_end();
+
+    /* Clear pointers/flags immediately so caller can attempt restart.
+     * The actual cleanup in lwIP may finish asynchronously; caller should
+     * call mqtt_client_poll() a few times to let lwIP flush timeouts.
+     */
+    client_data->mqtt_client_inst = NULL;
+    client_data->connect_done = false;
+    client_data->subscribe_count = 0;
 }
 
 bool mqtt_client_is_online(MQTT_CLIENT_DATA_T *client_data) {
