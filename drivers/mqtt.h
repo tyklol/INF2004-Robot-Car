@@ -56,6 +56,12 @@ void mqtt_client_poll(MQTT_CLIENT_DATA_T *client_data);
 /* Publish current temperature if connected. Safe to call from main loop. */
 void mqtt_client_publish_temperature(MQTT_CLIENT_DATA_T *client_data);
 
+void mqtt_pub_imu_raw(MQTT_CLIENT_DATA_T *client_data, float ax, float ay, float az, 
+    float gx, float gy, float gz, float mx, float my, float mz);
+
+void mqtt_pub_imu_filtered(MQTT_CLIENT_DATA_T *client_data, float fax, float fay, float faz,
+                           float roll, float pitch, float yaw);
+
 /* Publish arbitrary topic/data (wrapper). */
 void mqtt_client_publish(MQTT_CLIENT_DATA_T *client_data, const char *topic, const char *data);
 

@@ -60,6 +60,9 @@ target_link_libraries(${CMAKE_PROJECT_NAME}
     PRIVATE
     car_drivers
     pico_stdlib
+    hardware_pwm
+    hardware_gpio
+    hardware_timer
     FreeRTOS-Kernel  # <-- ADD THIS
     FreeRTOS-Kernel-Heap4
     hardware_sync

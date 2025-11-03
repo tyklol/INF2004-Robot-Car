@@ -14,7 +14,7 @@
 #include "drivers/ir.h"
 #include "drivers/encoder.h"     // <-- Includes new polling function
 #include "drivers/mqtt.h"
-#include "mqtt_test.c" // For WIFI_SSID, WIFI_PASSWORD, MQTT_SERVER
+#include "drivers/imu.h"
 // --- Pin Definitions for Buttons ---
 #define BUTTON_MODE_CALIBRATE  21 // GP21 (Calibration Step)
 #define BUTTON_MODE_START_STOP 20 // GP20 (Line Follow Toggle)
@@ -39,7 +39,8 @@
 #define WHEEL_CIRCUMFERENCE_MM  (3.14159265f * WHEEL_DIAMETER_MM)
 
 // --- Task Priorities ---
-#define MAIN_CONTROL_TASK_PRIORITY (tskIDLE_PRIORITY + 2UL)
+#define MAIN_CONTROL_TASK_PRIORITY (tskIDLE_PRIORITY + 3UL)
+#define IMU_TASK_PRIORITY           (tskIDLE_PRIORITY + 2UL)
 #define NETWORK_TASK_PRIORITY      (tskIDLE_PRIORITY + 1UL)
 
 // --- State Machine ---
@@ -88,6 +89,34 @@ float pid_calculate(pid_state_t *pid, float target, float current, float dt_s) {
     if (output > pid->max_output) output = pid->max_output;
     if (output < pid->min_output) output = pid->min_output;
     return output;
+}
+
+static float pid_step(pid_state_t* p, float err, float dt) {
+    p->integral += err * p->ki * dt;
+    if (p->integral > p->max_output) p->integral = p->max_output;
+    if (p->integral < p->min_output) p->integral = p->min_output;
+
+    float d = (err - p->last_error) / (dt > 0 ? dt : 1e-3f);
+    p->last_error = err;
+
+    float out = p->kp * err + p->integral + p->kd * d;
+    if (out > p->max_output) out = p->max_output;
+    if (out < p->min_output) out = p->min_output;
+    return out;
+}
+
+#define LOOP_HZ     20
+#define DT_SEC      (1.0f/LOOP_HZ)
+#define BASE_SPEED  35.0f
+#define TRIM_LIMIT  20.0f
+#define MQTT_MS     2000
+
+// ---------- Helpers ----------
+static float heading_err_deg(float target, float current) {
+    float e = target - current;
+    while (e > 180.f) e -= 360.f;
+    while (e < -180.f) e += 360.f;
+    return e;
 }
 
 // --- Shared Global State ---
@@ -312,7 +341,77 @@ void main_control_task(__unused void *params) {
 }
 
 /**
- * @brief TASK 2: Handles all Wi-Fi and MQTT communication.
+ * @brief TASK 2: Handles all IMU data processing.
+ */
+void imu_task(__unused void *params) {
+    // --- Heading target setup ---
+    imu_pose_t pose;
+    imu_update(&pose);
+    float yaw_target = pose.yaw_deg;
+    printf("[HEADING] target = %.1f deg\r\n", yaw_target);
+
+    // --- TODO: enable PID + motor trim later
+    pid_state_t pid;
+    pid_init(&pid, 1.0f, 0.02f, 0.10f, -TRIM_LIMIT, TRIM_LIMIT);
+
+    absolute_time_t last_pub = get_absolute_time();
+    uint32_t tick_ms = 0;
+
+    while (true) {
+        // --- Maintain Wi-Fi & MQTT background ---
+        cyw43_arch_poll();
+        sleep_ms(10);
+
+        // --- Update IMU readings ---
+        imu_update(&pose);
+
+        float err  = heading_err_deg(yaw_target, pose.yaw_deg);
+        float trim = pid_step(&pid, err, DT_SEC);
+
+        // --- Simulated motor outputs (safe build) ---
+        float left  = BASE_SPEED + trim;
+        float right = BASE_SPEED - trim;
+
+        if (left  > 100) left  = 100;
+        if (left  < -100) left = -100;
+        if (right > 100) right = 100;
+        if (right < -100) right = -100;
+
+        // --- Motor control disabled ---
+        // motor_set_speed(0, left);
+        // motor_set_speed(1, right);
+
+        // --- Debug output (console only) ---
+        printf("[SIM] yaw_tgt=%.1f yaw=%.1f err=%6.1f trim=%6.1f  L=%.1f R=%.1f  | roll=%.1f pitch=%.1f\r\n",
+               yaw_target, pose.yaw_deg, err, trim, left, right,
+               pose.roll_deg, pose.pitch_deg);
+
+        // --- MQTT publish (~5 Hz) ---
+        if (absolute_time_diff_us(last_pub, get_absolute_time()) > MQTT_MS * 1000) {
+            last_pub = get_absolute_time();
+            if (mqtt_client_is_online(&mqtt_state)) {
+                mqtt_pub_imu_raw(
+                    &mqtt_state, pose.ax, pose.ay, pose.az,
+                    0, 0, 0,                // gyro not used yet
+                    pose.mx, pose.my, pose.mz
+                );
+                mqtt_pub_imu_filtered(
+                    &mqtt_state, pose.ax, pose.ay, pose.az,
+                    pose.roll_deg, pose.pitch_deg, pose.yaw_deg
+                );
+                printf("[PUB] robot/imu/raw & robot/imu/filtered sent\r\n");
+            } else {
+                printf("[MQTT] not connected yet...\r\n");
+            }
+        }
+
+        sleep_ms(1000 / LOOP_HZ);
+        tick_ms += (1000 / LOOP_HZ);
+    }
+}
+
+/**
+ * @brief TASK 3: Handles all Wi-Fi and MQTT communication.
  */
 void network_task(__unused void *params) {
     if (cyw43_arch_init()) {
@@ -355,6 +454,20 @@ void vLaunch(void) {
     motor_init();
     ir_init();       
     encoder_init();  // <-- This now ONLY sets pin directions
+
+    // Set up IMU
+    setvbuf(stdout, NULL, _IONBF, 0);
+    printf("\r\n=== IMU-assisted Straight Drive (build-safe version, MQTT enabled) ===\r\n");
+
+    // --- I2C + IMU init
+    imu_init_i2c0_gp0_gp1();
+    if (!lsm303dlhc_init()) {
+        printf("IMU init failed (WHO_AM_I != 0x33)\r\n");
+        while (1) sleep_ms(1000);
+    }
+    printf("[IMU] Bias calibration... keep still.\r\n");
+    imu_calibrate_bias();
+    imu_set_accel_ema_alpha(0.12f);
     
     // --- 2. Setup Buttons ---
     gpio_init(BUTTON_MODE_CALIBRATE);
@@ -379,6 +492,7 @@ void vLaunch(void) {
     // --- 5. Create Tasks ---
     xTaskCreate(network_task, "NetworkTask", 2048, NULL, NETWORK_TASK_PRIORITY, NULL);
     xTaskCreate(main_control_task, "MainControlTask", 1024, NULL, MAIN_CONTROL_TASK_PRIORITY, NULL);
+    xTaskCreate(imu_task, "IMUTask", 1024, NULL, IMU_TASK_PRIORITY, NULL);
 
     // --- 6. Start the Scheduler ---
     printf("Starting FreeRTOS scheduler\n");

@@ -424,6 +424,36 @@ void mqtt_client_publish_temperature(MQTT_CLIENT_DATA_T *client_data) {
     publish_temperature_internal(client_data);
 }
 
+void mqtt_pub_imu_raw(MQTT_CLIENT_DATA_T *client_data, float ax, float ay, float az,
+                      float gx, float gy, float gz,
+                      float mx, float my, float mz) {
+    char buf[192];
+    int n = snprintf(buf, sizeof(buf),
+        "{\"ax\":%.3f,\"ay\":%.3f,\"az\":%.3f,"
+        "\"gx\":%.3f,\"gy\":%.3f,\"gz\":%.3f,"
+        "\"mx\":%.3f,\"my\":%.3f,\"mz\":%.3f}",
+        ax, ay, az, gx, gy, gz, mx, my, mz);
+    if (n <= 0 || n >= (int)sizeof(buf)) {
+        printf("mqtt_pub_imu_raw: snprintf error or buffer too small\n");
+    } else {
+        mqtt_client_publish(client_data, "robot/imu/raw", buf);
+    }
+}
+
+void mqtt_pub_imu_filtered(MQTT_CLIENT_DATA_T *client_data, float fax, float fay, float faz,
+                           float roll, float pitch, float yaw) {
+    char buf[192];
+    int n = snprintf(buf, sizeof(buf),
+        "{\"fax\":%.3f,\"fay\":%.3f,\"faz\":%.3f,"
+        "\"roll\":%.2f,\"pitch\":%.2f,\"yaw\":%.2f}",
+        fax, fay, faz, roll, pitch, yaw);
+    if (n <= 0 || n >= (int)sizeof(buf)) {
+        printf("mqtt_pub_imu_filtered: snprintf error or buffer too small\n");
+    } else {
+        mqtt_client_publish(client_data, "robot/imu/filtered", buf);
+    }
+}
+
 /* Thin wrappers for publish/subscribe/disconnect */
 
 void mqtt_client_publish(MQTT_CLIENT_DATA_T *client_data, const char *topic, const char *data) {
