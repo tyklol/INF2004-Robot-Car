@@ -1,323 +1,246 @@
+/*
+ * =====================================================================================
+ *
+ * Filename:  main.c
+ *
+ * Description:  Main application logic for Demo 1: Straight-line motion
+ * using IMU heading PID and encoder telemetry.
+ *
+ * =====================================================================================
+ */
+
+#include "pico/stdlib.h"
+#include "pico/time.h"
 #include <stdio.h>
 #include <math.h>
-#include "pico/stdlib.h"
-#include "hardware/gpio.h"
-#include "hardware/adc.h"
-#include "pico/cyw43_arch.h"
 
-// FreeRTOS includes
-#include "FreeRTOS.h"
-#include "task.h"
+// Include your project headers
+#include "motor.h"
+#include "encoder.h"
+#include "imu.h"
+#include "pid_controller.h"
 
-// Your driver includes
-#include "drivers/motor.h"
-#include "drivers/ir.h"       // Include the IR sensor driver
-#include "drivers/mqtt.h"     // Kept for network task
-#include "drivers/encoder.h"  // For polling total ticks
+// --- Demo Configuration ---
 
-// --- Pin Definitions for Buttons ---
-#define BUTTON_MODE_CALIBRATE  21 // GP21 (Calibration Step)
-#define BUTTON_MODE_START_STOP 20 // GP20 (Scenario Toggle)
+// Main control loop frequency (50 Hz)
+#define MAIN_LOOP_PERIOD_MS 20
+// Base speed to send to motors (e.g., 30% power)
+#define BASE_MOTOR_SPEED 40.0f
+// This constant is CRITICAL. You must measure your wheel circumference
+// and divide by the (number of encoder ticks per revolution).
+// (e.g., 20.4cm circ. / 40 ticks/rev = 0.51 cm/tick)
+#define CM_PER_TICK 0.51f
 
-// --- ADC Pin for Calibration ---
-#define PIN_IR_RIGHT_ADC_GPIO    26      // GP26 = ADC0
-#define PIN_IR_RIGHT_ADC_CH      0
-#define ADC_SMOOTH_SAMPLES       12
+// --- Heading PID Configuration ---
+// These values MUST be tuned for your robot's weight and motors.
+// Start with Kp and tune it first.
+#define HEADING_KP 1.2f  // Proportional gain (Adjust this first!)
+#define HEADING_KI 0.05f // Integral gain (Helps fix long-term drift)
+#define HEADING_KD 0.1f  // Derivative gain (Helps prevent overshooting)
 
-// --- Settings ---
-#define DEBOUNCE_TIME_US   150000 // 150 milliseconds
-#define PRINT_DELAY_MS     100    // Print values every 100ms
-#define CONTROL_LOOP_MS    10     // Run the *entire* control loop every 10ms (100Hz)
-#define TEMP_PUBLISH_INTERVAL_MS 1000 // Publish temp every 1 second
+// Limit the steering correction (e.g., +/- 25% speed)
+#define HEADING_PID_MIN_OUT -25.0f
+#define HEADING_PID_MAX_OUT 25.0f
+// Optional D-term smoothing (0.01s = 10ms)
+#define HEADING_D_TAU_S 0.01f
 
-// --- Task Priorities ---
-#define MAIN_CONTROL_TASK_PRIORITY (tskIDLE_PRIORITY + 2UL)
-#define NETWORK_TASK_PRIORITY      (tskIDLE_PRIORITY + 1UL)
+// --- Global State ---
+static pid_state_t g_pid_heading;
+static float g_target_heading_deg = 0.0f;
+static bool g_demo_running = false;
 
-// --- State Machine ---
-typedef enum {
-    STATIONARY_NOT_CALIBRATED,
-    CALIBRATE_WHITE_START, // Waiting for user to press on white
-    CALIBRATE_BLACK_START, // Waiting for user to press on black
-    CALIBRATED_STOPPED,    // This is the "home" state
-} RobotState;
-
-// --- Shared Global State ---
-RobotState current_state = STATIONARY_NOT_CALIBRATED;
-bool needs_update = true;
-uint32_t last_button_press_time = 0;
-uint16_t g_calib_white = 0;
-uint16_t g_calib_black = 0;
-bool g_is_calibrated = false;
-
-// --- NEW Scenario State ---
-int g_current_scenario = 0; // 0=STOP, 1-5=Test Scenarios
-float g_line_follow_power = 0.0f; // Will be set by the scenario
-
-float g_target_power_left = 0.0f;
-float g_target_power_right = 0.0f;
-uint16_t g_sensor_R = 0;
-const char *g_current_ir_state = "IDLE";
-uint32_t g_last_print_time = 0;
-
-int32_t g_total_ticks_left = 0;
-int32_t g_total_ticks_right = 0;
-
-static MQTT_CLIENT_DATA_T mqtt_state;
+// --- Telemetry Function (MQTT Stub) ---
 
 /**
- * @brief Blinks the onboard LED to indicate the current scenario.
- * State 0 = 1 blink, State 1 = 2 blinks, ..., State 5 = 6 blinks.
+ * @brief Publishes telemetry data.
+ * (REPLACE THIS with your actual MQTT publishing code)
  */
-void indicate_state_led(int scenario) {
-    int blinks = scenario + 1; 
-    vTaskDelay(pdMS_TO_TICKS(250)); // Wait a moment
-    for (int i = 0; i < blinks; i++) {
-        cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 1);
-        vTaskDelay(pdMS_TO_TICKS(150));
-        cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 0);
-        vTaskDelay(pdMS_TO_TICKS(150));
-    }
+void publish_telemetry(float speed_l_cm_s, float speed_r_cm_s,
+                       float dist_l_cm, float dist_r_cm,
+                       imu_pose_t *pose, float target_heading)
+{
+    // This just prints to the serial console.
+    // In a real implementation, you would format this as JSON or
+    // another format and publish to your MQTT topics.
+    printf(
+        "[Telemetry] Target:%.1f, Yaw:%.1f, Roll:%.1f, Pitch:%.1f, Spd_L:%.1f, Spd_R:%.1f, Dist_L:%.1f\n",
+        target_heading,
+        pose->yaw_deg,
+        pose->roll_deg,
+        pose->pitch_deg,
+        speed_l_cm_s,
+        speed_r_cm_s,
+        dist_l_cm);
+
+    // Example: Publishing raw vs. filtered data (as required by demo)
+    // Your imu_update() already provides the filtered accel (ax_f, ay_f, az_f)
+    // You would need to modify imu_update() to also pass out the *raw* accel
+    // values if you want to compare them.
+    // printf("[IMU] RawAX: %d, FltAX: %.2f\n", raw_ax, pose->ax);
 }
 
 /**
- * @brief Helper function to load tuning params for each scenario.
+ * @brief Calculates the shortest angle difference between two headings.
+ * Result is in range [-180, 180].
  */
-void apply_scenario_tune(int scenario) {
-    printf("\n--- CONFIGURING SCENARIO %d ---\n", scenario);
-    g_line_follow_power = 45.0f;
-    ir_set_tuning_params(28.0f, 0.0f, 0.4f, 30.0f, 1.0f, 0.7f, 1.3f, 0.25f);
-    printf("Tune 5: Balanced & Fast. BasePwr: %.1f\n", g_line_follow_power);
-    ir_reset_pid_state(); // Reset PID error terms on every change
+static inline float heading_error(float target, float current)
+{
+    float error = target - current;
+    while (error > 180.0f)
+        error -= 360.0f;
+    while (error <= -180.0f)
+        error += 360.0f;
+    return error;
 }
 
 /**
- * @brief MASTER ISR for BUTTONS
- * GP21 (Calibrate): Cycles through calibration states.
- * GP20 (Start/Stop): Cycles through scenarios 0-5.
+ * @brief Main control loop, called by a repeating timer.
  */
-void gpio_interrupt_handler(uint gpio, uint32_t events) {
-    if (gpio == BUTTON_MODE_CALIBRATE || gpio == BUTTON_MODE_START_STOP) {
-        uint32_t now = time_us_32();
-        if (now - last_button_press_time < DEBOUNCE_TIME_US) {
-            return;
-        }
-        last_button_press_time = now;
+bool main_loop_callback(struct repeating_timer *t)
+{
+    static imu_pose_t current_pose;
+    int32_t delta_ticks_left, delta_ticks_right;
+    const float dt_s = (float)MAIN_LOOP_PERIOD_MS / 1000.0f;
 
-        if (gpio == BUTTON_MODE_CALIBRATE) {
-            // Calibration Button Logic
-            if (current_state == STATIONARY_NOT_CALIBRATED) {
-                current_state = CALIBRATE_WHITE_START;
-            } else if (current_state == CALIBRATE_WHITE_START) {
-                current_state = CALIBRATE_BLACK_START;
-            } else if (current_state == CALIBRATE_BLACK_START) {
-                current_state = CALIBRATED_STOPPED;
-            } else if (current_state == CALIBRATED_STOPPED) {
-                current_state = STATIONARY_NOT_CALIBRATED;
-                g_is_calibrated = false;
-                g_current_scenario = 0; // Reset scenario if we re-calibrate
-            }
-        } else if (gpio == BUTTON_MODE_START_STOP) {
-            // Scenario Cycle Button Logic
-            if (g_is_calibrated) {
-                g_current_scenario = (g_current_scenario + 1) % 6; // Cycles 0-5
-            }
-        }
-        needs_update = true;
+    // --- 1. Read Sensors ---
+    imu_update(&current_pose);
+    encoder_update_and_get_ticks(&delta_ticks_left, &delta_ticks_right);
+
+    // --- 2. Calculate State & Telemetry ---
+    // Speed (cm/s)
+    float speed_l_cm_s = ((float)delta_ticks_left * CM_PER_TICK) / dt_s;
+    float speed_r_cm_s = ((float)delta_ticks_right * CM_PER_TICK) / dt_s;
+    // Total Distance (cm)
+    float dist_l_cm = (float)encoder_get_total_ticks_left() * CM_PER_TICK;
+    float dist_r_cm = (float)encoder_get_total_ticks_right() * CM_PER_TICK;
+
+    // --- 3. Run Control Logic ---
+    if (g_demo_running)
+    {
+        // Calculate the heading error (handles 359->1 degree wrap-around)
+        float error = heading_error(g_target_heading_deg, current_pose.yaw_deg);
+
+        // Calculate steering correction.
+        // We give the PID the error, and its target is 0.
+        // We use -error so a positive error (turn right) causes a positive bias.
+        float steering_bias = pid_calculate(&g_pid_heading, 0.0f, -error, dt_s);
+
+        // --- 4. Set Motors ---
+        // Apply differential steering bias
+        // --- 4. Set Motors ---
+        // Apply differential steering bias
+        // --- 4. Set Motors ---
+        // Apply differential steering bias
+        // SWAPPED signs to correct the steering direction
+        float motor_l_speed = BASE_MOTOR_SPEED - steering_bias;
+        float motor_r_speed = BASE_MOTOR_SPEED + steering_bias;
+
+        motor_set_speed(MOTOR_LEFT, motor_l_speed);
+        motor_set_speed(MOTOR_RIGHT, motor_r_speed);
     }
+    else
+    {
+        // Stop motors if demo isn't running
+        motor_set_speed(MOTOR_LEFT, 0.0f);
+        motor_set_speed(MOTOR_RIGHT, 0.0f);
+    }
+
+    // --- 5. Publish Telemetry ---
+    // (This runs whether the demo is active or not, for live data)
+    publish_telemetry(speed_l_cm_s, speed_r_cm_s, dist_l_cm, dist_r_cm,
+                      &current_pose, g_target_heading_deg);
+
+    return true; // Keep timer running
 }
 
-/**
- * @brief TASK 1: Handles all high-frequency robot control logic.
- */
-void main_control_task(__unused void *params) {
-    vTaskDelay(pdMS_TO_TICKS(500)); // Wait for network task to init CYW43
-    printf("Main control task started (5-Scenario Tuner).\n");
+// --- Main Application Entry ---
 
-    for (;;) {
-        // --- Poll encoders to update internal state ---
-        int32_t delta_ticks_left, delta_ticks_right;
-        encoder_update_and_get_ticks(&delta_ticks_left, &delta_ticks_right);
-
-        // --- Get TOTAL accumulated ticks for printing ---
-        g_total_ticks_left = encoder_get_total_ticks_left();
-        g_total_ticks_right = encoder_get_total_ticks_right();
-
-        // --- Handle State Change Requests ---
-        if (needs_update) {
-            needs_update = false;
-            
-            // Reset ticks on any state change
-            encoder_reset_total_ticks();
-            g_total_ticks_left = 0;
-            g_total_ticks_right = 0;
-
-            // Handle CALIBRATION state changes
-            switch (current_state) {
-                case STATIONARY_NOT_CALIBRATED:
-                    g_current_ir_state = "NO_CAL";
-                    printf("Mode: NOT CALIBRATED. Press GP21 to start.\n");
-                    break;
-                case CALIBRATE_WHITE_START:
-                    g_current_ir_state = "CAL_WHITE";
-                    printf("Mode: Place sensor on WHITE, press GP21 to save.\n");
-                    break;
-                case CALIBRATE_BLACK_START:
-                    g_calib_white = ir_read_single_sensor_raw();
-                    g_current_ir_state = "CAL_BLACK";
-                    printf("WHITE saved: %u. Place on BLACK, press GP21 to save.\n", g_calib_white);
-                    break;
-                case CALIBRATED_STOPPED:
-                    g_calib_black = ir_read_single_sensor_raw();
-                    ir_set_calibration_values(g_calib_white, g_calib_black);
-                    g_is_calibrated = true;
-                    g_current_ir_state = "CAL_STOP";
-                    printf("BLACK saved: %u. CALIBRATED! Press GP20 to cycle scenarios.\n", g_calib_black);
-                    printf("Calibration Range: %d (should be > 500)\n", (int)(g_calib_black - g_calib_white));
-                    
-                    // --- Auto-apply scenario 0 (STOP) on first calibration ---
-                    apply_scenario_tune(g_current_scenario);
-                    indicate_state_led(g_current_scenario);
-                    break;
-            }
-
-            // Handle SCENARIO state changes (only if calibrated)
-            if (g_is_calibrated) {
-                apply_scenario_tune(g_current_scenario);
-                indicate_state_led(g_current_scenario); // Blink to show new state
-            }
-        }
-
-        // --- Calculate Target Motor Power (for Line Following) ---
-        if (g_current_scenario > 0 && g_is_calibrated) { // Scenarios 1-5
-            ir_follow_line_single(g_line_follow_power, // Use the global var
-                                  &g_target_power_left, 
-                                  &g_target_power_right,
-                                  &g_sensor_R,
-                                  &g_current_ir_state);
-        } else { // Scenario 0 (STOP) or not calibrated
-            g_target_power_left = 0.0f;
-            g_target_power_right = 0.0f;
-        }
-
-        // --- Actuate Motors ---
-        motor_set_speed(MOTOR_LEFT, g_target_power_left);
-        motor_set_speed(MOTOR_RIGHT, g_target_power_right);
-
-        // --- Print Debugging Information ---
-        uint32_t now_ms = to_ms_since_boot(get_absolute_time());
-        if (now_ms - g_last_print_time > PRINT_DELAY_MS) {
-            g_last_print_time = now_ms;
-            
-            if (g_current_scenario > 0) {
-                printf("SCEN %d: %-9s | Pwr_L:%6.1f Pwr_R:%6.1f | Tick_L:%6ld Tick_R:%6ld | ADC:%4u\n",
-                       g_current_scenario,
-                       g_current_ir_state,
-                       g_target_power_left,
-                       g_target_power_right,
-                       g_total_ticks_left,
-                       g_total_ticks_right,
-                       g_sensor_R);
-            } else {
-                 printf("STOPPED | State: %-9s | Tick_L:%6ld Tick_R:%6ld | ADC:%4u\n",
-                       g_current_ir_state,
-                       g_total_ticks_left,
-                       g_total_ticks_right,
-                       ir_read_single_sensor_raw());
-            }
-        }
-
-        // Yield to other tasks
-        vTaskDelay(pdMS_TO_TICKS(CONTROL_LOOP_MS));
-    }
-}
-
-/**
- * @brief TASK 2: Handles all Wi-Fi and MQTT communication.
- * (No changes)
- */
-void network_task(__unused void *params) {
-    if (cyw43_arch_init()) {
-        printf("Wi-Fi init failed");
-        for (;;) { vTaskDelay(pdMS_TO_TICKS(1000)); }
-    } else {
-        printf("CYW43 Arch Initialized (for LED & Wi-Fi)\n");
-    }
-
-    printf("Network task started. Initializing MQTT...\n");
-    mqtt_client_init(&mqtt_state);
-
-    while (!mqtt_client_try_wifi_connect(&mqtt_state, 10000)) {
-        printf("WiFi connection failed, retrying in 2s...\n");
-        vTaskDelay(pdMS_TO_TICKS(2000));
-    }
-    
-    mqtt_client_start_mqtt(&mqtt_state);
-    uint32_t last_temp_publish_ms = to_ms_since_boot(get_absolute_time());
-
-    for (;;) {
-        mqtt_client_poll(&mqtt_state); 
-        uint32_t now_ms = to_ms_since_boot(get_absolute_time());
-        if (mqtt_client_is_online(&mqtt_state) && (now_ms - last_temp_publish_ms >= TEMP_PUBLISH_INTERVAL_MS)) {
-            last_temp_publish_ms = now_ms;
-            mqtt_client_publish_temperature(&mqtt_state);
-        }
-        vTaskDelay(pdMS_TO_TICKS(100));
-    }
-}
-
-/**
- * @brief The "launcher" function.
- * (No changes)
- */
-void vLaunch(void) {
-    // --- 1. Initialize Hardware ---
-    adc_init();
-    adc_gpio_init(PIN_IR_RIGHT_ADC_GPIO); // GP26
-
-    motor_init();
-    ir_init();      
-    encoder_init(); 
-    
-    // --- 2. Setup Buttons ---
-    gpio_init(BUTTON_MODE_CALIBRATE);
-    gpio_set_dir(BUTTON_MODE_CALIBRATE, GPIO_IN);
-    gpio_pull_up(BUTTON_MODE_CALIBRATE);
-    gpio_init(BUTTON_MODE_START_STOP);
-    gpio_set_dir(BUTTON_MODE_START_STOP, GPIO_IN);
-    gpio_pull_up(BUTTON_MODE_START_STOP);
-
-    // --- 3. Setup Interrupts (BUTTONS ONLY) ---
-    gpio_set_irq_enabled_with_callback(BUTTON_MODE_CALIBRATE, GPIO_IRQ_EDGE_FALL, true, &gpio_interrupt_handler);
-    gpio_set_irq_enabled(BUTTON_MODE_START_STOP, GPIO_IRQ_EDGE_FALL, true);
-    
-    // --- 4. Stop motors initially ---
-    motor_set_speed(MOTOR_LEFT, 0.0f);
-    motor_set_speed(MOTOR_RIGHT, 0.0f);
-    printf("Mode: STATIONARY. Press GP21 to start calibration.\n");
-
-    // --- 5. Create Tasks ---
-    xTaskCreate(network_task, "NetworkTask", 2048, NULL, NETWORK_TASK_PRIORITY, NULL);
-    xTaskCreate(main_control_task, "MainControlTask", 1024, NULL, MAIN_CONTROL_TASK_PRIORITY, NULL);
-
-    // --- 6. Start the Scheduler ---
-    printf("Starting FreeRTOS scheduler\n");
-    vTaskStartScheduler();
-}
-
-/**
- * @brief The main() entry point.
- * (No changes)
- */
-int main() {
+int main()
+{
     stdio_init_all();
-    sleep_ms(3000); // Wait for serial monitor to connect
-    printf("Robotic Car Program Started!\n");
-    printf("WIFI_SSID: %s\n", WIFI_SSID);
-    printf("MQTT_SERVER: %s\n", MQTT_SERVER);
+    sleep_ms(2000); // Wait for serial console to connect
+    printf("--- Demo 1: Straight Line IMU/Encoder Test ---\n");
 
-    vLaunch();
+    // --- 1. Initialize Hardware ---
+    printf("Initializing Motors...\n");
+    motor_init();
 
-    for (;;); // Unreachable
+    printf("Initializing Encoders...\n");
+    encoder_init();
+
+    printf("Initializing I2C and IMU (LSM303DLHC)...\n");
+    // Note: imu_init_i2c0_gp0_gp1() actually uses i2c1 on pins 2,3
+    if (!imu_init_i2c0_gp0_gp1())
+    {
+        printf("!! FATAL: I2C init failed.\n");
+        while (true)
+            ;
+    }
+    if (!lsm303dlhc_init())
+    {
+        printf("!! FATAL: LSM303DLHC sensor not found.\n");
+        while (true)
+            ;
+    }
+
+    // --- 2. Address Warnings ---
+    printf("\n--- !!! WARNINGS !!! ---\n");
+    printf("1. 'imu_calibrate_bias()' in imu.c does NOT calibrate the magnetometer.\n");
+    printf("   Heading will be INACCURATE until you implement full calibration!\n");
+    printf("2. 'encoder.c' only counts forward ticks via polling.\n");
+    printf("------------------------\n\n");
+
+    // --- 3. Run (Flawed) Calibration ---
+    printf("Place robot level and still. Running accel bias calibration...\n");
+    imu_calibrate_bias(); // This only calibrates Accel X/Y
+    printf("Calibration complete.\n");
+
+    // --- 4. Initialize PID Controller ---
+    pid_init(&g_pid_heading,
+             HEADING_KP, HEADING_KI, HEADING_KD,
+             HEADING_PID_MIN_OUT, HEADING_PID_MAX_OUT,
+             HEADING_D_TAU_S);
+
+    // --- 5. Get Target Heading ---
+    printf("Getting initial heading as target...\n");
+    imu_pose_t initial_pose;
+    // Read a few times to let filters settle
+    for (int i = 0; i < 10; i++)
+    {
+        imu_update(&initial_pose);
+        sleep_ms(20);
+    }
+
+    g_target_heading_deg = initial_pose.yaw_deg;
+    printf("... Target Heading SET to: %.2f degrees\n", g_target_heading_deg);
+
+    // --- 6. Initialize MQTT (Stub) ---
+    printf("Initializing MQTT (Stubbed with printf)...\n");
+    // your_mqtt_init_function();
+
+    // --- 7. Start Main Loop ---
+    printf("Starting main control loop (50 Hz).\n");
+    struct repeating_timer main_timer;
+    if (!add_repeating_timer_ms(MAIN_LOOP_PERIOD_MS, main_loop_callback, NULL, &main_timer))
+    {
+        printf("!! FATAL: Failed to start repeating timer.\n");
+        while (true)
+            ;
+    }
+
+    // --- 8. Start Demo ---
+    printf("\n*** ROBOT IS LIVE! Starting motion. ***\n");
+    encoder_reset_total_ticks();
+    pid_reset(&g_pid_heading);
+    g_demo_running = true;
+
+    // Everything else is handled by the timer ISR.
+    // The main thread can sleep or handle other tasks (e.g., MQTT keep-alives).
+    while (true)
+    {
+        // your_mqtt_loop_function();
+        sleep_ms(100);
+    }
+
     return 0;
 }

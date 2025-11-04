@@ -1,250 +1,492 @@
-#include "ir.h" // <-- Include the new header
-#include "pico/stdlib.h"
-#include "hardware/adc.h"
-#include <math.h>
 #include <stdio.h>
+#include <math.h>
+#include "pico/stdlib.h"
+#include "hardware/gpio.h"
+#include "hardware/adc.h"
+#include "pico/cyw43_arch.h"
 
-// ===== ROBOT CONFIG =====
-// We are a strict RIGHT-edge follower
-#define SENSOR_ON_RIGHT 1 // 1 = sensor on RIGHT, 0 = sensor on LEFT
-#define ALLOW_REVERSE 0   // 0 = never spin wheels backward (safer)
+// FreeRTOS includes
+#include "FreeRTOS.h"
+#include "task.h"
+#include "semphr.h" // --- DEMO 1 MOD --- Added for mutex
 
-// ---- Pin map ----
-#define PIN_IR_RIGHT_ADC_GPIO 26
+// Your driver includes
+#include "drivers/motor.h"
+#include "drivers/ir.h"      // Kept for init, but not used in control loop
+#include "drivers/mqtt.h"    // Kept for network task
+#include "drivers/encoder.h" // For polling total ticks
+#include "drivers/imu.h"
+#include "drivers/pid_controller.h" // We will use this extensively
+
+
+// --- Pin Definitions for Buttons ---
+#define BUTTON_SET_YAW 21         // GP21 (Set current heading as target)
+#define BUTTON_MODE_START_STOP 20 // GP20 (Scenario Toggle)
+
+// --- ADC Pin for Calibration ---
+// --- DEMO 1 MOD --- Not used for Demo 1, but kept for hardware init
+#define PIN_IR_RIGHT_ADC_GPIO 26 // GP26 = ADC0
 #define PIN_IR_RIGHT_ADC_CH 0
-#define ADC_SAMPLES 12 // Number of ADC samples to average
+#define ADC_SMOOTH_SAMPLES 12
 
-// ---- Calibration (set at runtime) ----
-static float SENSOR_WHITE = 180.0f;
-static float SENSOR_BLACK = 2400.0f;
+// --- Settings ---
+#define DEBOUNCE_TIME_US 150000         // 150 milliseconds
+#define PRINT_DELAY_MS 100              // Print values every 100ms
+#define CONTROL_LOOP_MS 10              // Run the *entire* control loop every 10ms (100Hz)
+#define TEMP_PUBLISH_INTERVAL_MS 1000   // Publish temp every 1 second
+#define MQTT_PUBLISH_INTERVAL_MS 200    // --- DEMO 1 MOD --- Publish telemetry every 200ms (5Hz)
 
-// ---- Line-Following PD Controller ----
-#define PID_SETPOINT 0.5f // Target: 50% (on the edge of the line)
+// --- ROBOT TUNING PARAMETERS (!!! TUNE THESE FOR DEMO 1 !!!) ---
+#define DEMO1_BASE_SPEED_TPS 40.0f      // Target speed in ticks-per-second
+#define DEMO1_TRIM_LIMIT_TPS 20.0f      // Max yaw correction (in ticks-per-second)
+#define DEMO1_MOTOR_MIN_POWER -80.0f    // Min motor power (leave headroom)
+#define DEMO1_MOTOR_MAX_POWER 80.0f     // Max motor power (leave headroom)
 
-// --- NEW: Timeout Switching Logic ---
-#define LINE_LOST_TIMEOUT_MS 750   // (TUNE THIS) Time on pure white to trigger a switch
-#define ON_WHITE_THRESHOLD 0.1f    // (TUNE THIS) Normalized value below this is "pure white"
+// --- PID GAINS (!!! TUNE THESE !!!) ---
+// Heading PID: Corrects yaw error, outputs a 'trim' in TPS
+#define DEMO1_HEADING_KP 1.2f
+#define DEMO1_HEADING_KI 0.05f
+#define DEMO1_HEADING_KD 0.15f
+#define DEMO1_HEADING_TAU 0.02f         // D-term filter time constant (s)
+
+// Wheel Speed PID: Corrects speed error, outputs motor power
+#define DEMO1_WHEEL_KP 2.0f             // Proportional (P)
+#define DEMO1_WHEEL_KI 1.0f             // Integral (I) - helps overcome friction
+#define DEMO1_WHEEL_KD 0.01f            // Derivative (D) - smooths response
+#define DEMO1_WHEEL_TAU 0.0f            // No D-term filter for wheels
+
+// --- Task Priorities ---
+#define MAIN_CONTROL_TASK_PRIORITY (tskIDLE_PRIORITY + 3UL)
+#define IMU_TASK_PRIORITY (tskIDLE_PRIORITY + 2UL)
+#define NETWORK_TASK_PRIORITY (tskIDLE_PRIORITY + 1UL)
+
+// --- State Machine (--- DEMO 1 MOD --- Simplified for Demo 1) ---
+typedef enum {
+    STOPPED_NO_YAW_TARGET, // Waiting for user to set yaw
+    STOPPED_YAW_SET,       // Yaw is set, ready to drive
+    DRIVING_STRAIGHT       // Driving
+} RobotState;
 
 
-// --- NEW: Tuning parameters are now variables ---
-typedef struct {
-    float kp;
-    float ki;
-    float kd;
-    float steer_clamp;
-    float base_scale;
-    float curve_slowdown;
-    float curve_exp;
-    float min_speed_frac;
-} ir_tuning_params_t;
-
-// Default to a very safe, slow tune (Scenario 1)
-static ir_tuning_params_t g_params = {
-    .kp = 28.0f,
-    .ki = 0.0f,
-    .kd = 0.4f,
-    .steer_clamp = 30.0f,
-    .base_scale = 1.0f,
-    .curve_slowdown = 0.7f,
-    .curve_exp = 1.3f,
-    .min_speed_frac = 0.25f
-};
+// --- IMU Task Definitions (from File 1) ---
+#define IMU_LOOP_HZ 20 // --- DEMO 1 MOD --- Renamed from LOOP_HZ
+#define DT_SEC (1.0f / IMU_LOOP_HZ)
 
 
-// ===== Internals =====
-static float pid_integral = 0.0f;
-static float pid_last_error = 0.0f;
-static absolute_time_t pid_last_time;
-static uint32_t g_time_on_white_ms = 0; // <-- NEW: Timeout counter
-
-// --- State Names for Telemetry ---
-static const char* STATE_NAME_TRACK = "S_TRACK";
-static const char* STATE_NAME_LOST_W = "S_LOST_WHT"; // All White
-static const char* STATE_NAME_LOST_B = "S_LOST_BLK"; // All Black
-static const char* STATE_NAME_SWITCH = "S_SWITCH";   // <-- NEW: Timeout state
-
-// --- Helper Functions ---
-static inline float clampf(float x, float lo, float hi) {
-    return x < lo ? lo : (x > hi ? hi : x);
+// ---------- Helpers (from File 1) ----------
+static float heading_err_deg(float target, float current)
+{
+    float e = target - current;
+    while (e > 180.f)
+        e -= 360.f;
+    while (e < -180.f)
+        e += 360.f;
+    return e;
 }
 
-static uint16_t adc_read_avg(uint ch, int samples) {
-    adc_select_input(ch);
-    uint32_t acc = 0;
-    for (int i = 0; i < samples; i++) acc += adc_read();
-    return (uint16_t)(acc / samples);
-}
+// --- Shared Global State ---
+RobotState current_state = STOPPED_NO_YAW_TARGET;
+bool needs_update = true;
+uint32_t last_button_press_time = 0;
 
-// ===== Public API =====
+// --- DEMO 1 MOD --- Global state for PID controllers and telemetry
+pid_state_t g_pid_heading;
+pid_state_t g_pid_wheel_left;
+pid_state_t g_pid_wheel_right;
+
+float g_yaw_target_deg = 0.0f;
+float g_target_power_left = 0.0f;  // Current power sent to left motor
+float g_target_power_right = 0.0f; // Current power sent to right motor
+float g_current_speed_left_tps = 0.0f;  // Measured speed
+float g_current_speed_right_tps = 0.0f; // Measured speed
+
+int32_t g_total_ticks_left = 0;
+int32_t g_total_ticks_right = 0;
+uint32_t g_last_print_time = 0;
+
+// --- DEMO 1 MOD --- IMU data shared with a mutex
+static imu_pose_t g_latest_pose;
+static SemaphoreHandle_t g_pose_mutex;
+
+// --- Global State (from File 1, needed for other tasks) ---
+static MQTT_CLIENT_DATA_T mqtt_state;
+
+
+// --- LED Blink (from File 2) ---
+void blink_led(int count, int delay_ms) {
+    for (int i = 0; i < count; i++) {
+        cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 1);
+        vTaskDelay(pdMS_TO_TICKS(delay_ms));
+        cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 0);
+        vTaskDelay(pdMS_TO_TICKS(delay_ms));
+    }
+}
 
 /**
- * @brief NEW: Public function to update the static tuning params.
+ * @brief MASTER ISR for BUTTONS ONLY
+ * --- DEMO 1 MOD --- Simplified state flow for Demo 1 ---
  */
-void ir_set_tuning_params(float kp, float ki, float kd,
-                          float steer_clamp, float base_scale,
-                          float curve_slowdown, float curve_exp,
-                          float min_speed_frac) 
+void gpio_interrupt_handler(uint gpio, uint32_t events) {
+    if (gpio == BUTTON_SET_YAW || gpio == BUTTON_MODE_START_STOP) {
+        uint32_t now = time_us_32();
+        if (now - last_button_press_time < DEBOUNCE_TIME_US) {
+            return;
+        }
+        last_button_press_time = now;
+
+        if (gpio == BUTTON_SET_YAW) {
+            // --- Set current yaw as the target ---
+            if (xSemaphoreTakeFromISR(g_pose_mutex, NULL) == pdTRUE) {
+                g_yaw_target_deg = g_latest_pose.yaw_deg;
+                xSemaphoreGiveFromISR(g_pose_mutex, NULL);
+            }
+            
+            if (current_state == STOPPED_NO_YAW_TARGET) {
+                current_state = STOPPED_YAW_SET;
+            }
+            // If already driving or stopped, just reset the target
+            needs_update = true;
+
+        } else if (gpio == BUTTON_MODE_START_STOP) {
+            if (current_state == STOPPED_YAW_SET) {
+                current_state = DRIVING_STRAIGHT;
+            } else if (current_state == DRIVING_STRAIGHT) {
+                current_state = STOPPED_YAW_SET;
+            }
+            // If yaw is not set, this button does nothing
+            needs_update = true;
+        }
+    }
+}
+
+/**
+ * @brief TASK 1: Handles all high-frequency robot control logic.
+ * --- DEMO 1 MOD --- This task now runs the full stabilization PID loop ---
+ */
+void main_control_task(__unused void *params) {
+    vTaskDelay(pdMS_TO_TICKS(1000)); // Wait for IMU to be ready
+    printf("Main control task started (Demo 1: Straight Line).\n");
+
+    absolute_time_t last_loop_time = get_absolute_time();
+    float dt_s = (float)CONTROL_LOOP_MS / 1000.0f; // Initial dt
+
+    for (;;) {
+        // --- 1. Calculate precise dt ---
+        absolute_time_t now = get_absolute_time();
+        dt_s = (float)absolute_time_diff_us(last_loop_time, now) / 1000000.0f;
+        last_loop_time = now;
+        if (dt_s <= 0.0f) { dt_s = (float)CONTROL_LOOP_MS / 1000.0f; } // Safety fallback
+
+        // --- 2. Get All Sensor Data ---
+        
+        // Get IMU pose
+        imu_pose_t local_pose;
+        if (xSemaphoreTake(g_pose_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+            local_pose = g_latest_pose;
+            xSemaphoreGive(g_pose_mutex);
+        } else {
+            // Failed to get mutex, skip this control loop
+            printf("WARN: main_control_task failed to get pose mutex.\n");
+            vTaskDelay(pdMS_TO_TICKS(CONTROL_LOOP_MS));
+            continue;
+        }
+
+        // Get Encoder deltas
+        int32_t delta_ticks_left, delta_ticks_right;
+        encoder_update_and_get_ticks(&delta_ticks_left, &delta_ticks_right);
+
+        // Update total ticks (for telemetry)
+        g_total_ticks_left = encoder_get_total_ticks_left();
+        g_total_ticks_right = encoder_get_total_ticks_right();
+
+        // Calculate current speeds in Ticks-Per-Second
+        g_current_speed_left_tps = (float)delta_ticks_left / dt_s;
+        g_current_speed_right_tps = (float)delta_ticks_right / dt_s;
+
+
+        // --- 3. Handle State Change Requests ---
+        if (needs_update) {
+            needs_update = false;
+            
+            // Reset motor power
+            g_target_power_left = 0.0f;
+            g_target_power_right = 0.0f;
+            motor_set_speed(MOTOR_LEFT, 0.0f);
+            motor_set_speed(MOTOR_RIGHT, 0.0f);
+
+            // --- DEMO 1 MOD --- State logic for Demo 1
+            switch (current_state) {
+                case STOPPED_NO_YAW_TARGET:
+                    printf("Mode: STOPPED. Press GP21 to set target yaw.\n");
+                    blink_led(1, 200);
+                    break;
+                case STOPPED_YAW_SET:
+                    printf("Mode: STOPPED. Yaw target: %.1f. Press GP20 to start.\n", g_yaw_target_deg);
+                    // Init all 3 PIDs
+                    pid_init(&g_pid_heading, DEMO1_HEADING_KP, DEMO1_HEADING_KI, DEMO1_HEADING_KD,
+                             -DEMO1_TRIM_LIMIT_TPS, DEMO1_TRIM_LIMIT_TPS, DEMO1_HEADING_TAU);
+                    pid_init(&g_pid_wheel_left, DEMO1_WHEEL_KP, DEMO1_WHEEL_KI, DEMO1_WHEEL_KD,
+                             DEMO1_MOTOR_MIN_POWER, DEMO1_MOTOR_MAX_POWER, DEMO1_WHEEL_TAU);
+                    pid_init(&g_pid_wheel_right, DEMO1_WHEEL_KP, DEMO1_WHEEL_KI, DEMO1_WHEEL_KD,
+                             DEMO1_MOTOR_MIN_POWER, DEMO1_MOTOR_MAX_POWER, DEMO1_WHEEL_TAU);
+                    blink_led(2, 200);
+                    break;
+                case DRIVING_STRAIGHT:
+                    printf("Mode: DRIVING STRAIGHT! Base Speed: %.1f tps\n", DEMO1_BASE_SPEED_TPS);
+                    // Reset encoders and PIDs for a fresh start
+                    encoder_reset_total_ticks();
+                    g_total_ticks_left = 0;
+                    g_total_ticks_right = 0;
+                    pid_reset(&g_pid_heading);
+                    pid_reset(&g_pid_wheel_left);
+                    pid_reset(&g_pid_wheel_right);
+                    blink_led(3, 100);
+                    break;
+            }
+        }
+
+        // --- 4. Run Control Logic ---
+        if (current_state == DRIVING_STRAIGHT) {
+            // --- Heading PID ---
+            // Calculate error (target = 0, current = -error)
+            float yaw_error = heading_err_deg(g_yaw_target_deg, local_pose.yaw_deg);
+            float trim_tps = pid_calculate(&g_pid_heading, 0.0f, -yaw_error, dt_s);
+
+            // --- Wheel Speed Targets ---
+            float target_speed_L = DEMO1_BASE_SPEED_TPS + trim_tps;
+            float target_speed_R = DEMO1_BASE_SPEED_TPS - trim_tps;
+
+            // --- Wheel Speed PIDs ---
+            g_target_power_left = pid_calculate(&g_pid_wheel_left, target_speed_L, g_current_speed_left_tps, dt_s);
+            g_target_power_right = pid_calculate(&g_pid_wheel_right, target_speed_R, g_current_speed_right_tps, dt_s);
+
+        } else {
+            // State is STOPPED
+            g_target_power_left = 0.0f;
+            g_target_power_right = 0.0f;
+            g_current_speed_left_tps = 0.0f;
+            g_current_speed_right_tps = 0.0f;
+        }
+
+        // --- 5. Actuate Motors ---
+        motor_set_speed(MOTOR_LEFT, g_target_power_left);
+        motor_set_speed(MOTOR_RIGHT, g_target_power_right);
+
+
+        // --- 6. Print Debugging Information ---
+        uint32_t now_ms = to_ms_since_boot(get_absolute_time());
+        if (now_ms - g_last_print_time > PRINT_DELAY_MS) {
+            g_last_print_time = now_ms;
+            if (current_state == DRIVING_STRAIGHT) {
+                printf("Yaw(Tgt/Cur):%5.1f/%5.1f | Spd(L/R):%5.1f/%5.1f | Pwr(L/R):%5.1f/%5.1f | Ticks(L/R):%ld/%ld\n",
+                       g_yaw_target_deg, local_pose.yaw_deg,
+                       g_current_speed_left_tps, g_current_speed_right_tps,
+                       g_target_power_left, g_target_power_right,
+                       g_total_ticks_left, g_total_ticks_right);
+            } else {
+                 printf("STOPPED | Yaw(Tgt/Cur):%5.1f/%5.1f | Press GP20 to start.\n",
+                       g_yaw_target_deg, local_pose.yaw_deg);
+            }
+        }
+
+        // Yield to other tasks
+        vTaskDelay(pdMS_TO_TICKS(CONTROL_LOOP_MS));
+    }
+}
+
+
+/**
+ * @brief TASK 2: Handles all IMU data processing.
+ * --- DEMO 1 MOD --- This task ONLY reads IMU data and updates the global pose.
+ */
+void imu_task(__unused void *params)
 {
-    g_params.kp = kp;
-    g_params.ki = ki;
-    g_params.kd = kd;
-    g_params.steer_clamp = steer_clamp;
-    g_params.base_scale = base_scale;
-    g_params.curve_slowdown = curve_slowdown;
-    g_params.curve_exp = curve_exp;
-    g_params.min_speed_frac = min_speed_frac;
-}
+    // Wait for CYW43 and IMU to be init'd by other tasks
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    printf("IMU task started.\n");
 
-void ir_init(void) {
-    // ADC is initialized in main.c
-    ir_reset_pid_state();
-}
+    imu_pose_t local_pose; // Local struct to hold new data
 
-void ir_reset_pid_state(void) {
-    pid_integral = 0.0f;
-    pid_last_error = 0.0f;
-    pid_last_time = get_absolute_time(); // Set last_t to now
-    g_time_on_white_ms = 0; // <-- NEW: Reset timeout counter
-}
+    while (true)
+    {
+        // --- 1. Update IMU readings ---
+        imu_update(&local_pose);
 
-void ir_set_calibration_values(uint16_t white, uint16_t black) {
-    SENSOR_WHITE = (float)white;
-    SENSOR_BLACK = (float)black;
-
-    // Safety check: if black reads *lower* than white, swap them
-    if (SENSOR_BLACK < SENSOR_WHITE) {
-        printf("WARNING: Black ADC < White ADC. Swapping values.\n");
-        float temp = SENSOR_BLACK;
-        SENSOR_BLACK = SENSOR_WHITE;
-        SENSOR_WHITE = temp;
-    }
-
-    // Safety check: if range is too small, create a fake range
-    if (fabsf(SENSOR_BLACK - SENSOR_WHITE) < 100.0f) {
-        printf("WARNING: Small IR range. White=%d Black=%d\n", (int)SENSOR_WHITE, (int)SENSOR_BLACK);
-        SENSOR_BLACK = SENSOR_WHITE + 500.0f;
-    }
-    
-    printf("IR Cal: White=%.0f Black=%.0f Range=%.0f\n",
-           SENSOR_WHITE, SENSOR_BLACK, SENSOR_BLACK - SENSOR_WHITE);
-}
-
-uint16_t ir_read_single_sensor_raw(void) {
-    return adc_read_avg(PIN_IR_RIGHT_ADC_CH, ADC_SAMPLES);
-}
-
-// --- MODIFIED FUNCTION SIGNATURE ---
-void ir_follow_line_single(IrTrackingMode *p_mode,
-                           float base_speed_tps,
-                           float *out_target_left_tps, float *out_target_right_tps,
-                           uint16_t *out_R_adc,
-                           const char **out_state_name) {
-    
-    // 1) Read & normalize sensor to [0.0 ... 1.0]
-    uint16_t R_adc = adc_read_avg(PIN_IR_RIGHT_ADC_CH, ADC_SAMPLES);
-    float R_norm = (R_adc - SENSOR_WHITE) / (SENSOR_BLACK - SENSOR_WHITE);
-    R_norm = clampf(R_norm, 0.0f, 1.0f); // Clamp to 0.0 (white) or 1.0 (black)
-
-    // 2) Calculate delta-time (dt) for PID and Timeout
-    absolute_time_t now = get_absolute_time();
-    float dt_s = absolute_time_diff_us(pid_last_time, now) / 1e6f; // in seconds
-    if (dt_s <= 0.0f || dt_s > 0.1f) dt_s = 0.01f; // Use 10ms default
-    pid_last_time = now;
-    uint32_t dt_ms = (uint32_t)(dt_s * 1000.0f);
-
-    // --- NEW: Timeout State-Switching Logic ---
-    bool timed_out = false;
-    if (R_norm < ON_WHITE_THRESHOLD) {
-        // We are on pure white, increment the "lost" timer
-        g_time_on_white_ms += dt_ms;
-    } else {
-        // We see the line (edge or black), so reset the timer
-        g_time_on_white_ms = 0;
-    }
-
-    if (g_time_on_white_ms > LINE_LOST_TIMEOUT_MS) {
-        // TIMEOUT! We've lost the line. Switch tracking states.
-        if (*p_mode == TRACK_RIGHT_EDGE) {
-            *p_mode = TRACK_LEFT_EDGE;
-        } else {
-            *p_mode = TRACK_RIGHT_EDGE;
+        // --- 2. Update shared global w/ mutex ---
+        if (xSemaphoreTake(g_pose_mutex, portMAX_DELAY) == pdTRUE)
+        {
+            g_latest_pose = local_pose;
+            xSemaphoreGive(g_pose_mutex);
         }
-        g_time_on_white_ms = 0; // Reset timer to prevent re-triggering
-        timed_out = true;       // Flag for telemetry
+
+        // --- 3. Debug output (optional) ---
+        // (The main_control_task printf is more useful)
+        // printf("[IMU] yaw=%.1f | roll=%.1f pitch=%.1f\r\n",
+        //        local_pose.yaw_deg, local_pose.roll_deg, local_pose.pitch_deg);
+
+        // --- 4. Delay ---
+        vTaskDelay(pdMS_TO_TICKS(1000 / IMU_LOOP_HZ));
     }
-    // --- End of New Logic ---
+}
 
-
-    // 3) Calculate error for PD controller
-    float error = R_norm - PID_SETPOINT;
-
-    // 4) Calculate PD terms (USING g_params NOW)
-    float p_term = g_params.kp * error;
-
-    if (g_params.ki != 0.0f) {
-        pid_integral += error * dt_s;
-        pid_integral = clampf(pid_integral, -10.0f, 10.0f); // Anti-windup
-    } else {
-        pid_integral = 0.0f;
+/**
+ * @brief TASK 3: Handles all Wi-Fi and MQTT communication.
+ * --- DEMO 1 MOD --- Moved IMU publish logic here from old imu_task.
+ */
+void network_task(__unused void *params)
+{
+    if (cyw43_arch_init())
+    {
+        printf("Wi-Fi init failed");
+        for (;;) { vTaskDelay(pdMS_TO_TICKS(1000)); }
     }
-    float i_term = g_params.ki * pid_integral;
-
-    float derivative = (error - pid_last_error) / dt_s;
-    pid_last_error = error;
-    float d_term = g_params.kd * derivative;
-
-    // 5) Calculate final steering command (in tps)
-    float steer = p_term + i_term + d_term;
-    steer = clampf(steer, -g_params.steer_clamp, +g_params.steer_clamp);
-
-    // 6) Dynamic Speed: Slow down in corners (USING g_params NOW)
-    float steer_frac = fabsf(steer) / g_params.steer_clamp; 
-    float curve_scale = 1.0f - (g_params.curve_slowdown * powf(steer_frac, g_params.curve_exp));
-    curve_scale = clampf(curve_scale, g_params.min_speed_frac, 1.0f);
-
-    float final_base_speed = base_speed_tps * g_params.base_scale * curve_scale;
-
-    // 7) Map steer to wheel targets based on *CURRENT MODE*
-    float left_tps;
-    float right_tps;
-
-    // SENSOR_ON_RIGHT is assumed to be 1 (true)
-    if (*p_mode == TRACK_RIGHT_EDGE) {
-        // To track RIGHT edge:
-        // - On White (error < 0, steer < 0) -> Turn LEFT (L-, R+)
-        // - On Black (error > 0, steer > 0) -> Turn RIGHT (L+, R-)
-        left_tps  = final_base_speed + steer;
-        right_tps = final_base_speed - steer;
-    } else {
-        // To track LEFT edge:
-        // - On White (error < 0, steer < 0) -> Turn RIGHT (L+, R-)
-        // - On Black (error > 0, steer > 0) -> Turn LEFT (L-, R+)
-        left_tps  = final_base_speed - steer;
-        right_tps = final_base_speed + steer;
+    else
+    {
+        printf("CYW43 Arch Initialized (for LED & Wi-Fi)\n");
     }
 
+    printf("Network task started. Initializing MQTT...\n");
+    mqtt_client_init(&mqtt_state);
 
-    // 8) Apply "No Reverse" logic
-    #if !ALLOW_REVERSE
-    if (left_tps  < 0.0f) left_tps  = 0.0f;
-    if (right_tps < 0.0f) right_tps = 0.0f;
-    #endif
+    while (!mqtt_client_try_wifi_connect(&mqtt_state, 10000))
+    {
+        printf("WiFi connection failed, retrying in 2s...\n");
+        vTaskDelay(pdMS_TO_TICKS(2000));
+    }
 
-    // 9) Set outputs
-    *out_target_left_tps  = left_tps;
-    *out_target_right_tps = right_tps;
-    if (out_R_adc) *out_R_adc = R_adc;
+    mqtt_client_start_mqtt(&mqtt_state);
+    uint32_t last_temp_publish_ms = to_ms_since_boot(get_absolute_time());
+    uint32_t last_telemetry_publish_ms = to_ms_since_boot(get_absolute_time()); // --- DEMO 1 MOD ---
 
-    // 10) Set state for telemetry
-    if (out_state_name) {
-        if (timed_out) {
-            *out_state_name = STATE_NAME_SWITCH; // Switched state
-        } else if (R_norm < 0.1f) {
-            *out_state_name = STATE_NAME_LOST_W; // On white (but not timed out)
-        } else if (R_norm > 0.9f) {
-            *out_state_name = STATE_NAME_LOST_B; // On black
-        } else {
-            *out_state_name = STATE_NAME_TRACK;  // Tracking
+    for (;;)
+    {
+        mqtt_client_poll(&mqtt_state);
+        uint32_t now_ms = to_ms_since_boot(get_absolute_time());
+
+        if (mqtt_client_is_online(&mqtt_state))
+        {
+            // --- Publish core telemetry (IMU, speed, etc.) ---
+            if (now_ms - last_telemetry_publish_ms >= MQTT_PUBLISH_INTERVAL_MS)
+            {
+                last_telemetry_publish_ms = now_ms;
+                
+                // Get a safe copy of the IMU data
+                imu_pose_t local_pose;
+                if (xSemaphoreTake(g_pose_mutex, pdMS_TO_TICKS(10)) == pdTRUE)
+                {
+                    local_pose = g_latest_pose;
+                    xSemaphoreGive(g_pose_mutex);
+
+                    // Publish IMU data (as in original imu_task)
+                    // Publish IMU data (as in original imu_task)
+                    mqtt_pub_imu_raw(
+                        &mqtt_state, local_pose.ax, local_pose.ay, local_pose.az,
+                        0.0f, 0.0f, 0.0f, // Pass 0 for gyro (gx, gy, gz) - LSM303DLHC has no gyro
+                        local_pose.mx, local_pose.my, local_pose.mz);
+                    mqtt_pub_imu_filtered(
+                        &mqtt_state, local_pose.ax, local_pose.ay, local_pose.az,
+                        local_pose.roll_deg, local_pose.pitch_deg, local_pose.yaw_deg);
+                } else {
+                    printf("WARN: network_task failed to get pose mutex.\n");
+                }
+                
+                // --- DEMO 1 MOD --- Publish speed, distance, and power
+                // (Assuming your mqtt.c has functions for these topics)
+                
+                // mqtt_pub_speeds(&mqtt_state, g_current_speed_left_tps, g_current_speed_right_tps);
+                // mqtt_pub_distance(&mqtt_state, (float)g_total_ticks_left, (float)g_total_ticks_right);
+                // mqtt_pub_power(&mqtt_state, g_target_power_left, g_target_power_right);
+                // mqtt_pub_pid_outputs(&mqtt_state, g_pid_heading.integral, g_pid_wheel_left.integral, g_pid_wheel_right.integral);
+            }
+
+            // --- Publish Pico temperature (less frequently) ---
+            if (now_ms - last_temp_publish_ms >= TEMP_PUBLISH_INTERVAL_MS)
+            {
+                last_temp_publish_ms = now_ms;
+                mqtt_client_publish_temperature(&mqtt_state);
+            }
         }
+        
+        vTaskDelay(pdMS_TO_TICKS(100)); // Poll MQTT client 10x/sec
     }
+}
+
+/**
+ * @brief The "launcher" function.
+ */
+void vLaunch(void)
+{
+    // --- 1. Initialize Hardware ---
+    adc_init();
+    adc_gpio_init(PIN_IR_RIGHT_ADC_GPIO); // GP26
+
+    motor_init();
+    ir_init();      // Init IR sensors (even if not used for this demo)
+    encoder_init();
+
+    // --- I2C + IMU init ---
+    setvbuf(stdout, NULL, _IONBF, 0);
+    printf("\r\n=== DEMO 1: Straight Line Stabilization ===\r\n");
+
+    imu_init_i2c0_gp0_gp1();
+    if (!lsm303dlhc_init()) // --- DEMO 1 MOD --- Assuming lsm303, use your IMU init
+    {
+        printf("IMU init failed (WHO_AM_I check failed)\r\n");
+        while (1) { blink_led(5, 100); sleep_ms(1000); }
+    }
+    printf("[IMU] Bias calibration... keep still.\r\n");
+    imu_calibrate_bias();
+    imu_set_accel_ema_alpha(0.12f);
+    // --- End of IMU init ---
+
+    // --- 2. Create Mutex ---
+    g_pose_mutex = xSemaphoreCreateMutex(); // --- DEMO 1 MOD ---
+    if (g_pose_mutex == NULL) {
+        printf("FATAL: Failed to create mutex.\n");
+        while(1) { blink_led(10, 50); sleep_ms(1000); }
+    }
+
+    // --- 3. Setup Buttons ---
+    gpio_init(BUTTON_SET_YAW);
+    gpio_set_dir(BUTTON_SET_YAW, GPIO_IN);
+    gpio_pull_up(BUTTON_SET_YAW);
+    gpio_init(BUTTON_MODE_START_STOP);
+    gpio_set_dir(BUTTON_MODE_START_STOP, GPIO_IN);
+    gpio_pull_up(BUTTON_MODE_START_STOP);
+
+    // --- 4. Setup Interrupts (BUTTONS ONLY) ---
+    gpio_set_irq_enabled_with_callback(BUTTON_SET_YAW, GPIO_IRQ_EDGE_FALL, true, &gpio_interrupt_handler);
+    gpio_set_irq_enabled(BUTTON_MODE_START_STOP, GPIO_IRQ_EDGE_FALL, true);
+
+    // --- 5. Stop motors initially ---
+    motor_set_speed(MOTOR_LEFT, 0.0f);
+    motor_set_speed(MOTOR_RIGHT, 0.0f);
+    printf("Mode: STOPPED. Press GP21 to set yaw target.\n");
+
+    // --- 6. Create Tasks ---
+    xTaskCreate(network_task, "NetworkTask", 2048, NULL, NETWORK_TASK_PRIORITY, NULL);
+    xTaskCreate(main_control_task, "MainControlTask", 2048, NULL, MAIN_CONTROL_TASK_PRIORITY, NULL); // --- DEMO 1 MOD --- Increased stack
+    xTaskCreate(imu_task, "IMUTask", 1024, NULL, IMU_TASK_PRIORITY, NULL);
+
+    // --- 7. Start the Scheduler ---
+    printf("Starting FreeRTOS scheduler\n");
+    vTaskStartScheduler();
+}
+
+/**
+ * @brief The main() entry point.
+ */
+int main()
+{
+    stdio_init_all();
+    sleep_ms(3000); // Wait for serial monitor to connect
+    printf("Robotic Car Program Started!\n");
+    printf("WIFI_SSID: %s\n", WIFI_SSID);
+    printf("MQTT_SERVER: %s\n", MQTT_SERVER);
+
+    vLaunch();
+
+    for (;;)
+        ; // Unreachable
+    return 0;
 }

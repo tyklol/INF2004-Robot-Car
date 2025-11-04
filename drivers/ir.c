@@ -5,25 +5,25 @@
 #include <stdio.h>
 
 // ===== ROBOT CONFIG =====
-// We are a strict LEFT-edge follower
-#define SENSOR_ON_RIGHT 0      // 1 = sensor on RIGHT, 0 = sensor on LEFT
-#define ALLOW_REVERSE   0      // 0 = never spin wheels backward (safer)
+// We are a strict RIGHT-edge follower
+#define SENSOR_ON_RIGHT 1 // 1 = sensor on RIGHT, 0 = sensor on LEFT
+#define ALLOW_REVERSE 0   // 0 = never spin wheels backward (safer)
 
 // ---- Pin map ----
-// (Assuming sensor is now plugged into the same pin)
-#define PIN_IR_LEFT_ADC_GPIO 26
-#define PIN_IR_LEFT_ADC_CH   0
-#define ADC_SAMPLES          12    // Number of ADC samples to average
+#define PIN_IR_RIGHT_ADC_GPIO 26
+#define PIN_IR_RIGHT_ADC_CH 0
+#define ADC_SAMPLES 12 // Number of ADC samples to average
 
 // ---- Calibration (set at runtime) ----
 static float SENSOR_WHITE = 180.0f;
 static float SENSOR_BLACK = 2400.0f;
 
 // ---- Line-Following PD Controller ----
-#define PID_SETPOINT     0.5f   // Target: 50% (on the edge of the line)
+#define PID_SETPOINT 0.5f // Target: 50% (on the edge of the line)
 
 // --- NEW: Tuning parameters are now variables ---
-typedef struct {
+typedef struct
+{
     float kp;
     float ki;
     float kd;
@@ -43,29 +43,34 @@ static ir_tuning_params_t g_params = {
     .base_scale = 1.0f,
     .curve_slowdown = 0.5f,
     .curve_exp = 1.2f,
-    .min_speed_frac = 0.4f
-};
-
+    .min_speed_frac = 0.4f};
 
 // ===== Internals =====
 static float pid_integral = 0.0f;
 static float pid_last_error = 0.0f;
 static absolute_time_t pid_last_time;
 
+// --- NEW: Debouncing for track gaps ---
+static int lost_white_counter = 0;
+static int lost_black_counter = 0;
+#define LOST_DEBOUNCE_THRESHOLD 3 //
 // --- State Names for Telemetry ---
-static const char* STATE_NAME_TRACK = "S_TRACK";
-static const char* STATE_NAME_LOST_W = "S_LOST_WHT"; // All White
-static const char* STATE_NAME_LOST_B = "S_LOST_BLK"; // All Black
+static const char *STATE_NAME_TRACK = "S_TRACK";
+static const char *STATE_NAME_LOST_W = "S_LOST_WHT"; // All White
+static const char *STATE_NAME_LOST_B = "S_LOST_BLK"; // All Black
 
 // --- Helper Functions ---
-static inline float clampf(float x, float lo, float hi) {
+static inline float clampf(float x, float lo, float hi)
+{
     return x < lo ? lo : (x > hi ? hi : x);
 }
 
-static uint16_t adc_read_avg(uint ch, int samples) {
+static uint16_t adc_read_avg(uint ch, int samples)
+{
     adc_select_input(ch);
     uint32_t acc = 0;
-    for (int i = 0; i < samples; i++) acc += adc_read();
+    for (int i = 0; i < samples; i++)
+        acc += adc_read();
     return (uint16_t)(acc / samples);
 }
 
@@ -74,10 +79,10 @@ static uint16_t adc_read_avg(uint ch, int samples) {
 /**
  * @brief NEW: Public function to update the static tuning params.
  */
-void ir_set_tuning_params(float kp, float ki, float kd, 
-                          float steer_clamp, float base_scale, 
-                          float curve_slowdown, float curve_exp, 
-                          float min_speed_frac) 
+void ir_set_tuning_params(float kp, float ki, float kd,
+                          float steer_clamp, float base_scale,
+                          float curve_slowdown, float curve_exp,
+                          float min_speed_frac)
 {
     g_params.kp = kp;
     g_params.ki = ki;
@@ -89,23 +94,27 @@ void ir_set_tuning_params(float kp, float ki, float kd,
     g_params.min_speed_frac = min_speed_frac;
 }
 
-void ir_init(void) {
+void ir_init(void)
+{
     // ADC is initialized in main.c
     ir_reset_pid_state();
 }
 
-void ir_reset_pid_state(void) {
+void ir_reset_pid_state(void)
+{
     pid_integral = 0.0f;
     pid_last_error = 0.0f;
     pid_last_time = get_absolute_time(); // Set last_t to now
 }
 
-void ir_set_calibration_values(uint16_t white, uint16_t black) {
+void ir_set_calibration_values(uint16_t white, uint16_t black)
+{
     SENSOR_WHITE = (float)white;
     SENSOR_BLACK = (float)black;
 
     // Safety check: if black reads *lower* than white, swap them
-    if (SENSOR_BLACK < SENSOR_WHITE) {
+    if (SENSOR_BLACK < SENSOR_WHITE)
+    {
         printf("WARNING: Black ADC < White ADC. Swapping values.\n");
         float temp = SENSOR_BLACK;
         SENSOR_BLACK = SENSOR_WHITE;
@@ -113,38 +122,33 @@ void ir_set_calibration_values(uint16_t white, uint16_t black) {
     }
 
     // Safety check: if range is too small, create a fake range
-    if (fabsf(SENSOR_BLACK - SENSOR_WHITE) < 100.0f) {
+    if (fabsf(SENSOR_BLACK - SENSOR_WHITE) < 100.0f)
+    {
         printf("WARNING: Small IR range. White=%d Black=%d\n", (int)SENSOR_WHITE, (int)SENSOR_BLACK);
         SENSOR_BLACK = SENSOR_WHITE + 500.0f;
     }
-    
+
     printf("IR Cal: White=%.0f Black=%.0f Range=%.0f\n",
            SENSOR_WHITE, SENSOR_BLACK, SENSOR_BLACK - SENSOR_WHITE);
 }
 
-uint16_t ir_read_single_sensor_raw(void) {
-    // Read the LEFT sensor now
-    return adc_read_avg(PIN_IR_LEFT_ADC_CH, ADC_SAMPLES);
+uint16_t ir_read_single_sensor_raw(void)
+{
+    return adc_read_avg(PIN_IR_RIGHT_ADC_CH, ADC_SAMPLES);
 }
 
 void ir_follow_line_single(float base_speed_tps,
                            float *out_target_left_tps, float *out_target_right_tps,
-                           uint16_t *out_R_adc, // <-- NOTE: Kept name for API compatibility
+                           uint16_t *out_R_adc,
                            const char **out_state_name) {
     
     // 1) Read & normalize sensor to [0.0 ... 1.0]
-    uint16_t L_adc = adc_read_avg(PIN_IR_LEFT_ADC_CH, ADC_SAMPLES);
-    float norm = (L_adc - SENSOR_WHITE) / (SENSOR_BLACK - SENSOR_WHITE);
-    norm = clampf(norm, 0.0f, 1.0f); // Clamp to 0.0 (white) or 1.0 (black)
+    uint16_t R_adc = adc_read_avg(PIN_IR_RIGHT_ADC_CH, ADC_SAMPLES);
+    float R_norm = (R_adc - SENSOR_WHITE) / (SENSOR_BLACK - SENSOR_WHITE);
+    R_norm = clampf(R_norm, 0.0f, 1.0f); // Clamp to 0.0 (white) or 1.0 (black)
 
     // 2) Calculate error for PD controller
-    //    RIGHT sensor: error = norm - SETPOINT (if > 0.5, on black, turn right)
-    //    LEFT sensor:  error = SETPOINT - norm (if > 0.5, on black, turn left)
-#if SENSOR_ON_RIGHT
-    float error = norm - PID_SETPOINT;
-#else
-    float error = PID_SETPOINT - norm; // Inverted for LEFT sensor
-#endif
+    float error = R_norm - PID_SETPOINT;
 
     // 3) Calculate delta-time (dt) for PID
     absolute_time_t now = get_absolute_time();
@@ -178,9 +182,7 @@ void ir_follow_line_single(float base_speed_tps,
 
     float final_base_speed = base_speed_tps * g_params.base_scale * curve_scale;
 
-    // 7) Map steer to wheel targets
-    //    Positive steer = turn RIGHT (Left wheel faster, Right wheel slower)
-    //    Negative steer = turn LEFT (Left wheel slower, Right wheel faster)
+    // 7) Map steer to wheel targets (RIGHT-EDGE LOGIC)
     float left_tps  = final_base_speed + steer;
     float right_tps = final_base_speed - steer;
 
@@ -190,23 +192,59 @@ void ir_follow_line_single(float base_speed_tps,
     if (right_tps < 0.0f) right_tps = 0.0f;
     #endif
 
-    // 9) Set outputs
+    // 9) Set outputs (pre-recovery)
     *out_target_left_tps  = left_tps;
     *out_target_right_tps = right_tps;
-    
-    // Pass the LEFT sensor value to the output pointer.
-    // The pointer is still named 'out_R_adc' to avoid breaking 
-    // the function's API (i.e., changing the .h file).
-    if (out_R_adc) *out_R_adc = L_adc;
+    if (out_R_adc) *out_R_adc = R_adc;
 
-    // 10) Set state for telemetry
+    // 10) Set state for telemetry (WITH DEBOUNCING)
     if (out_state_name) {
-        if (norm < 0.1f) {
-            *out_state_name = STATE_NAME_LOST_W;
-        } else if (norm > 0.9f) {
-            *out_state_name = STATE_NAME_LOST_B;
+        if (R_norm < 0.1f) {
+            // Potentially lost on white
+            lost_white_counter++;
+            lost_black_counter = 0; // Reset other counter
+            
+            if (lost_white_counter > LOST_DEBOUNCE_THRESHOLD) { // <-- Fixed typo
+                *out_state_name = STATE_NAME_LOST_W;
+            } else {
+                // Not lost *yet*, it's just a gap.
+                *out_state_name = STATE_NAME_TRACK;
+                pid_last_error = 0.0f; // Reset error to prevent PID windup
+                pid_integral = 0.0f;
+            }
+
+        } else if (R_norm > 0.9f) {
+            // Potentially lost on black
+            lost_black_counter++;
+            lost_white_counter = 0; // Reset other counter
+
+            if (lost_black_counter > LOST_DEBOUNCE_THRESHOLD) { // <-- Fixed typo
+                *out_state_name = STATE_NAME_LOST_B;
+            } else {
+                // Not lost *yet*, treat as on track
+                *out_state_name = STATE_NAME_TRACK;
+                pid_last_error = 0.0f; // Reset error
+                pid_integral = 0.0f;
+            }
+
         } else {
+            // Clearly on the line edge
+            lost_white_counter = 0;
+            lost_black_counter = 0;
             *out_state_name = STATE_NAME_TRACK;
         }
+    }
+
+    // 11) Apply recovery logic (RIGHT-EDGE LOGIC)
+    if (*out_state_name == STATE_NAME_LOST_W) 
+    {
+        // We are on WHITE, the line is somewhere to the LEFT.
+        // Hard Left Turn: Left wheel reverse/stop, Right wheel forward
+        *out_target_left_tps  = -base_speed_tps;
+        *out_target_right_tps =  base_speed_tps;
+
+        #if !ALLOW_REVERSE
+        if (*out_target_left_tps < 0.0f) *out_target_left_tps = 0.0f;
+        #endif
     }
 }

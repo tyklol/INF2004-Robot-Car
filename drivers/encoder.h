@@ -5,8 +5,8 @@
 #include <stdint.h>
 
 // --- PIN Definitions ---
-#define PIN_ENC_L 0 // Left Encoder (GP7)
-#define PIN_ENC_R 7 // Right Encoder (GP0)
+#define PIN_ENC_L 7 // Left Encoder (GP7)
+#define PIN_ENC_R 0 // Right Encoder (GP0)
 
 /**
  * @brief Initializes the encoder GPIO pins as inputs.

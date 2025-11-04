@@ -31,7 +31,10 @@ static bool  a_init = false;
 
 static float a_bias_x=0, a_bias_y=0, a_bias_z=0;  // accel DC offsets (counts)
 static float m_bias_x=0, m_bias_y=0, m_bias_z=0;  // mag DC offsets (raw units)
-
+// Make these global or static global in imu.c
+static int16_t m_min_x = 32767, m_max_x = -32768;
+static int16_t m_min_y = 32767, m_max_y = -32768;
+static int16_t m_min_z = 32767, m_max_z = -32768;
 static imu_pose_t latest;
 
 #ifndef M_PI
@@ -156,23 +159,87 @@ static void read_mag_raw(int16_t* mx, int16_t* my, int16_t* mz) {
 }
 
 void imu_calibrate_bias(void) {
-    const int N=200;
-    double sax=0, say=0, saz=0;
-    double smx=0, smy=0, smz=0;
-    for (int i=0;i<N;i++){
-        int16_t x,y,z; read_accel_counts(&x,&y,&z);
-        int16_t mx,my,mz; read_mag_raw(&mx,&my,&mz);
-        sax+=x; say+=y; saz+=z;
-        smx+=mx; smy+=my; smz+=mz;
+    // --- Stage 1: Accelerometer Calibration (Robot MUST be still) ---
+    printf("--- ACCEL CALIBRATION ---\n");
+    printf("Place robot on a LEVEL surface and DO NOT MOVE.\n");
+    printf("Starting in 3...\n"); sleep_ms(1000);
+    printf("Starting in 2...\n"); sleep_ms(1000);
+    printf("Starting in 1...\n"); sleep_ms(1000);
+    printf("Calibrating... DO NOT MOVE.\n");
+
+    const int N_ACCEL = 200;
+    double sax = 0, say = 0, saz = 0;
+
+    for (int i = 0; i < N_ACCEL; i++) {
+        int16_t x, y, z; 
+        read_accel_counts(&x, &y, &z);
+        sax += x; say += y; saz += z;
         sleep_ms(10);
     }
-    a_bias_x = (float)(sax/N);
-    a_bias_y = (float)(say/N);
-    a_bias_z = (float)(saz/N);
-    m_bias_x = (float)(smx/N);
-    m_bias_y = (float)(smy/N);
-    m_bias_z = (float)(smz/N);
-    a_init = false; // re-seed EMA at next update
+    
+    // Calibrate X and Y (assuming it's level)
+    a_bias_x = (float)(sax / N_ACCEL);
+    a_bias_y = (float)(say / N_ACCEL);
+    // DO NOT calibrate Z for gravity.
+    a_bias_z = 0.0f;
+    a_init = false; // re-seed EMA
+    
+    printf("Accel cal done. X_bias=%.2f, Y_bias=%.2f\n\n", a_bias_x, a_bias_y);
+    sleep_ms(1000);
+
+    // --- Stage 2: Magnetometer Calibration (Robot MUST rotate) ---
+    printf("--- MAG CALIBRATION ---\n");
+    printf("Pick up the robot. You will slowly rotate it 360 degrees\n");
+    printf("on all axes (spin it, flip it end-over-end, etc.)\n");
+    printf("Press ENTER key to start collecting data for 15 seconds...\n");
+    
+    // Wait for user to press Enter in the serial monitor
+    while (getchar_timeout_us(1000) == PICO_ERROR_TIMEOUT);
+
+    printf("GO! Calibrating... Rotate robot slowly on all axes...\n");
+    
+    m_min_x = 32767; m_max_x = -32768;
+    m_min_y = 32767; m_max_y = -32768;
+    m_min_z = 32767; m_max_z = -32768;
+
+    uint32_t start_time = time_us_32();
+    uint32_t cal_duration_ms = 15000; // 15 seconds
+
+    while ( (time_us_32() - start_time) < (cal_duration_ms * 1000) ) {
+        int16_t mx, my, mz;
+        read_mag_raw(&mx, &my, &mz);
+
+        if (mx < m_min_x) m_min_x = mx;
+        if (mx > m_max_x) m_max_x = mx;
+        if (my < m_min_y) m_min_y = my;
+        if (my > m_max_y) m_max_y = my;
+        if (mz < m_min_z) m_min_z = mz;
+        if (mz > m_max_z) m_max_z = mz;
+        
+        // Print progress
+        if ( (time_us_32() - start_time) % 1000000 < 20000) { // every second
+             printf("... %lus left ...\n", (cal_duration_ms*1000 - (time_us_32() - start_time))/1000000);
+        }
+        
+        sleep_ms(20); // sample at 50Hz
+    }
+
+    printf("...DONE collecting data.\n");
+
+    // Calculate hard-iron offsets (the center of the data cloud)
+    float bias_x = (float)(m_max_x + m_min_x) / 2.0f;
+    float bias_y = (float)(m_max_y + m_min_y) / 2.0f;
+    float bias_z = (float)(m_max_z + m_min_z) / 2.0f;
+
+    // Set the biases that imu_update() will use
+    imu_set_mag_bias(bias_x, bias_y, bias_z);
+    
+    printf("Magnetometer Calibration COMPLETE.\n");
+    printf("  X_bias: %.2f (min: %d, max: %d)\n", bias_x, m_min_x, m_max_x);
+    printf("  Y_bias: %.2f (min: %d, max: %d)\n", bias_y, m_min_y, m_max_y);
+    printf("  Z_bias: %.2f (min: %d, max: %d)\n", bias_z, m_min_z, m_max_z);
+    printf("--------------------------------------------\n\n");
+    sleep_ms(2000);
 }
 
 static void accel_filter_push(float x, float y, float z) {
