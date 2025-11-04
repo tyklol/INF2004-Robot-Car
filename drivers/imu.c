@@ -191,10 +191,33 @@ void imu_calibrate_bias(void) {
     printf("--- MAG CALIBRATION ---\n");
     printf("Pick up the robot. You will slowly rotate it 360 degrees\n");
     printf("on all axes (spin it, flip it end-over-end, etc.)\n");
-    printf("Press ENTER key to start collecting data for 15 seconds...\n");
+    // printf("Press ENTER key to start collecting data for 15 seconds...\n");
     
-    // Wait for user to press Enter in the serial monitor
-    while (getchar_timeout_us(1000) == PICO_ERROR_TIMEOUT);
+    // // Wait for user to press Enter in the serial monitor
+    // while (getchar_timeout_us(1000) == PICO_ERROR_TIMEOUT);
+    printf("Press BUTTON GP21 to start collecting data for 15 seconds...\n");
+
+    // Wait for user to press the calibration button (GP21).
+    // Use BUTTON_MODE_CALIBRATE if available, otherwise fall back to pin 21.
+#ifdef BUTTON_MODE_CALIBRATE
+    const uint btn_pin = BUTTON_MODE_CALIBRATE;
+#else
+    const uint btn_pin = 21;
+#endif
+    gpio_init(btn_pin);
+    gpio_set_dir(btn_pin, GPIO_IN);
+    gpio_pull_up(btn_pin);
+
+    // wait for active-low press, with simple debounce (press then release)
+    while (gpio_get(btn_pin) != 0) {
+        sleep_ms(10);
+    }
+    // short debounce and wait for release
+    sleep_ms(50);
+    while (gpio_get(btn_pin) == 0) {
+        sleep_ms(10);
+    }
+    sleep_ms(50);
 
     printf("GO! Calibrating... Rotate robot slowly on all axes...\n");
     
@@ -203,7 +226,7 @@ void imu_calibrate_bias(void) {
     m_min_z = 32767; m_max_z = -32768;
 
     uint32_t start_time = time_us_32();
-    uint32_t cal_duration_ms = 15000; // 15 seconds
+    uint32_t cal_duration_ms = 20000; // 15 seconds
 
     while ( (time_us_32() - start_time) < (cal_duration_ms * 1000) ) {
         int16_t mx, my, mz;
