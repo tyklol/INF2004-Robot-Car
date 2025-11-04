@@ -56,11 +56,24 @@ void mqtt_client_poll(MQTT_CLIENT_DATA_T *client_data);
 /* Publish current temperature if connected. Safe to call from main loop. */
 void mqtt_client_publish_temperature(MQTT_CLIENT_DATA_T *client_data);
 
-void mqtt_pub_imu_raw(MQTT_CLIENT_DATA_T *client_data, float ax, float ay, float az, 
+void mqtt_publish_imu_raw(MQTT_CLIENT_DATA_T *client_data, float ax, float ay, float az, 
     float gx, float gy, float gz, float mx, float my, float mz);
 
-void mqtt_pub_imu_filtered(MQTT_CLIENT_DATA_T *client_data, float fax, float fay, float faz,
+void mqtt_publish_imu_filtered(MQTT_CLIENT_DATA_T *client_data, float fax, float fay, float faz,
                            float roll, float pitch, float yaw);
+                           
+void mqtt_publish_speed(MQTT_CLIENT_DATA_T *client_data, const char *g_current_ir_state,
+    float g_target_speed_left_tps, float g_current_speed_left_tps, float g_final_power_left,
+    float g_target_speed_right_tps, float g_current_speed_right_tps, float g_final_power_right,
+    uint16_t g_sensor_R);
+
+void mqtt_publish_obstacle(MQTT_CLIENT_DATA_T *client_data, float distance, float width, const char* side);
+
+void mqtt_publish_state(MQTT_CLIENT_DATA_T *client_data, const char* mode, const char* state, const char* phase);
+
+void mqtt_publish_line(MQTT_CLIENT_DATA_T *client_data, int on_line, float error, float effort);
+
+void mqtt_publish_barcode(MQTT_CLIENT_DATA_T *client_data, const char* command);
 
 /* Publish arbitrary topic/data (wrapper). */
 void mqtt_client_publish(MQTT_CLIENT_DATA_T *client_data, const char *topic, const char *data);

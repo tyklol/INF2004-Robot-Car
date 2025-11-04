@@ -393,6 +393,16 @@ int mqtt_client_start_mqtt(MQTT_CLIENT_DATA_T *client_data) {
     cyw43_arch_lwip_end();
 
     if (err == ERR_OK) {
+        // DNS resolved synchronously; ensure any stale client is cleaned up
+        if (client_data->mqtt_client_inst && !mqtt_client_is_connected(client_data->mqtt_client_inst)) {
+            INFO_printf("mqtt_client_start_mqtt: cleaning up existing mqtt_client_inst before start_client\n");
+            cyw43_arch_lwip_begin();
+            mqtt_disconnect(client_data->mqtt_client_inst);
+            cyw43_arch_lwip_end();
+            client_data->mqtt_client_inst = NULL;
+            client_data->connect_done = false;
+            client_data->subscribe_count = 0;
+        }
         // DNS resolved synchronously; start_client should be invoked now.
         // Call start_client explicitly to ensure consistent behaviour and capture its return value.
         int rc = start_client(client_data);
@@ -424,7 +434,7 @@ void mqtt_client_publish_temperature(MQTT_CLIENT_DATA_T *client_data) {
     publish_temperature_internal(client_data);
 }
 
-void mqtt_pub_imu_raw(MQTT_CLIENT_DATA_T *client_data, float ax, float ay, float az,
+void mqtt_publish_imu_raw(MQTT_CLIENT_DATA_T *client_data, float ax, float ay, float az,
                       float gx, float gy, float gz,
                       float mx, float my, float mz) {
     char buf[192];
@@ -434,13 +444,13 @@ void mqtt_pub_imu_raw(MQTT_CLIENT_DATA_T *client_data, float ax, float ay, float
         "\"mx\":%.3f,\"my\":%.3f,\"mz\":%.3f}",
         ax, ay, az, gx, gy, gz, mx, my, mz);
     if (n <= 0 || n >= (int)sizeof(buf)) {
-        printf("mqtt_pub_imu_raw: snprintf error or buffer too small\n");
+        printf("mqtt_publish_imu_raw: snprintf error or buffer too small\n");
     } else {
         mqtt_client_publish(client_data, "robot/imu/raw", buf);
     }
 }
 
-void mqtt_pub_imu_filtered(MQTT_CLIENT_DATA_T *client_data, float fax, float fay, float faz,
+void mqtt_publish_imu_filtered(MQTT_CLIENT_DATA_T *client_data, float fax, float fay, float faz,
                            float roll, float pitch, float yaw) {
     char buf[192];
     int n = snprintf(buf, sizeof(buf),
@@ -448,17 +458,99 @@ void mqtt_pub_imu_filtered(MQTT_CLIENT_DATA_T *client_data, float fax, float fay
         "\"roll\":%.2f,\"pitch\":%.2f,\"yaw\":%.2f}",
         fax, fay, faz, roll, pitch, yaw);
     if (n <= 0 || n >= (int)sizeof(buf)) {
-        printf("mqtt_pub_imu_filtered: snprintf error or buffer too small\n");
+        printf("mqtt_publish_imu_filtered: snprintf error or buffer too small\n");
     } else {
         mqtt_client_publish(client_data, "robot/imu/filtered", buf);
+    }
+}
+
+void mqtt_publish_speed(MQTT_CLIENT_DATA_T *client_data, const char *g_current_ir_state,
+                       float g_target_speed_left_tps, float g_current_speed_left_tps, float g_final_power_left,
+                       float g_target_speed_right_tps, float g_current_speed_right_tps, float g_final_power_right,
+                       uint16_t g_sensor_R) {
+    char buf[192];
+    int n = snprintf(buf, sizeof(buf),
+        "\"LINE\": %-9s, \"Tgt_L\":%6.1f, \"Cur_L\":%6.1f, \"Pwr_L\":%6.1f | \"Tgt_R\":%6.1f, \"Cur_R\":%6.1f, \"Pwr_R\":%6.1f | \"ADC\":%4u",
+            g_current_ir_state,
+            g_target_speed_left_tps, g_current_speed_left_tps, g_final_power_left,
+            g_target_speed_right_tps, g_current_speed_right_tps, g_final_power_right,
+            g_sensor_R);
+    if (n <= 0 || n >= (int)sizeof(buf)) {
+        printf("mqtt_publish_speed: snprintf error or buffer too small\n");
+    } else {
+        mqtt_client_publish(client_data, "robot/speed", buf);
+    }
+}
+
+void mqtt_publish_obstacle(MQTT_CLIENT_DATA_T *client_data, float distance, float width, const char* side) {
+    char buf[128];
+    int n = snprintf(buf, sizeof(buf),
+        "{\"distance\":%.3f,\"width\":%.3f,\"side\":\"%s\"}",
+        distance, width, side);
+    if (n <= 0 || n >= (int)sizeof(buf)) {
+        printf("mqtt_publish_obstacle: snprintf error or buffer too small\n");
+    } else {
+        mqtt_client_publish(client_data, "robot/obstacle", buf);
+    }
+}
+
+void mqtt_publish_state(MQTT_CLIENT_DATA_T *client_data, const char* mode, const char* state, const char* phase) {
+    char buf[128];
+    int n = snprintf(buf, sizeof(buf),
+        "{\"mode\":\"%s\",\"state\":\"%s\",\"phase\":\"%s\"}",
+        mode, state, phase);
+    if (n <= 0 || n >= (int)sizeof(buf)) {
+        printf("mqtt_publish_state: snprintf error or buffer too small\n");
+    } else {
+        mqtt_client_publish(client_data, "robot/state", buf);
+    }
+}
+
+void mqtt_publish_line(MQTT_CLIENT_DATA_T *client_data, int on_line, float error, float effort) {
+    char buf[64];
+    int n = snprintf(buf, sizeof(buf),
+        "{\"on_line\":%d,\"err\":%.3f, \"effort\":%.3f}",
+        on_line, error, effort);
+    if (n <= 0 || n >= (int)sizeof(buf)) {
+        printf("mqtt_publish_line: snprintf error or buffer too small\n");
+    } else {
+        mqtt_client_publish(client_data, "robot/line", buf);
+    }
+}
+
+void mqtt_publish_barcode(MQTT_CLIENT_DATA_T *client_data, const char* command) {
+    char buf[64];
+    int n = snprintf(buf, sizeof(buf),
+        "{\"command\":\"%s\"}",
+        command);
+    if (n <= 0 || n >= (int)sizeof(buf)) {
+        printf("mqtt_publish_barcode: snprintf error or buffer too small\n");
+    } else {
+        mqtt_client_publish(client_data, "robot/barcode", buf);
     }
 }
 
 /* Thin wrappers for publish/subscribe/disconnect */
 
 void mqtt_client_publish(MQTT_CLIENT_DATA_T *client_data, const char *topic, const char *data) {
-    if (!client_data || !client_data->mqtt_client_inst) return;
-    mqtt_publish(client_data->mqtt_client_inst, topic, data, strlen(data), MQTT_PUBLISH_QOS, MQTT_PUBLISH_RETAIN, pub_request_cb, client_data);
+    // if (!client_data || !client_data->mqtt_client_inst) return;
+    // mqtt_publish(client_data->mqtt_client_inst, topic, data, strlen(data), MQTT_PUBLISH_QOS, MQTT_PUBLISH_RETAIN, pub_request_cb, client_data);
+
+    if (!client_data || !client_data->mqtt_client_inst) {
+        DEBUG_printf("mqtt_client_publish: client not ready, topic=%s\n", topic);
+        return;
+    }
+
+    err_t err;
+    cyw43_arch_lwip_begin();
+    err = mqtt_publish(client_data->mqtt_client_inst, topic, data, strlen(data), MQTT_PUBLISH_QOS, MQTT_PUBLISH_RETAIN, pub_request_cb, client_data);
+    cyw43_arch_lwip_end();
+
+    if (err != ERR_OK) {
+        ERROR_printf("mqtt_client_publish: mqtt_publish returned %d for topic=%s\n", err, topic);
+    } else {
+        DEBUG_printf("mqtt_client_publish: queued topic=%s\n", topic);
+    }
 }
 
 void mqtt_client_subscribe(MQTT_CLIENT_DATA_T *client_data, const char *topic) {

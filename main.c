@@ -29,6 +29,7 @@
 #define PRINT_DELAY_MS     100    // Print values every 100ms
 #define CONTROL_LOOP_MS    10     // Run the *entire* control loop every 10ms (100Hz)
 #define TEMP_PUBLISH_INTERVAL_MS 1000 // Publish temp every 1 second
+#define SPEED_PUBLISH_INTERVAL_MS 1000 // Publish speed every 1 second
 
 // --- ROBOT TUNING PARAMETERS (!!! TUNE THESE !!!) ---
 #define LINE_FOLLOW_SPEED  30.0f  // INCREASED from 20.0f - Target speed (tps) for line following.
@@ -109,7 +110,7 @@ static float pid_step(pid_state_t* p, float err, float dt) {
 #define DT_SEC      (1.0f/LOOP_HZ)
 #define BASE_SPEED  35.0f
 #define TRIM_LIMIT  20.0f
-#define MQTT_MS     2000
+#define MQTT_MS     1000
 
 // ---------- Helpers ----------
 static float heading_err_deg(float target, float current) {
@@ -135,6 +136,7 @@ volatile uint16_t g_sensor_R = 0;
 volatile const char *g_current_ir_state = "IDLE";
 uint32_t g_last_print_time = 0;
 static MQTT_CLIENT_DATA_T mqtt_state;
+volatile imu_pose_t g_imu_pose;
 
 // --- NEW: Add these globals for diagnostics ---
 volatile float g_current_speed_left_tps = 0.0f;
@@ -311,29 +313,29 @@ void main_control_task(__unused void *params) {
         motor_set_speed(MOTOR_RIGHT, final_power_right);
 
         // --- 5. Non-blocking print ---
-        uint32_t now_ms = to_ms_since_boot(get_absolute_time());
-        if (now_ms - g_last_print_time > PRINT_DELAY_MS) {
-            g_last_print_time = now_ms;
+        // uint32_t now_ms = to_ms_since_boot(get_absolute_time());
+        // if (now_ms - g_last_print_time > PRINT_DELAY_MS) {
+        //     g_last_print_time = now_ms;
 
-            if (current_state == LINE_FOLLOW_SINGLE) {
-                float normalized = 0.0f;
-                if (g_calib_black != g_calib_white) {
-                    normalized = (float)(g_sensor_R - g_calib_white) / (float)(g_calib_black - g_calib_white);
-                }
+        //     if (current_state == LINE_FOLLOW_SINGLE) {
+        //         float normalized = 0.0f;
+        //         if (g_calib_black != g_calib_white) {
+        //             normalized = (float)(g_sensor_R - g_calib_white) / (float)(g_calib_black - g_calib_white);
+        //         }
                 
-                printf("LINE: %-9s | Tgt_L:%6.1f Cur_L:%6.1f Pwr_L:%6.1f | Tgt_R:%6.1f Cur_R:%6.1f Pwr_R:%6.1f | ADC:%4u Norm:%.2f\n",
-                    g_current_ir_state,
-                    g_target_speed_left_tps, g_current_speed_left_tps, g_final_power_left,
-                    g_target_speed_right_tps, g_current_speed_right_tps, g_final_power_right,
-                    g_sensor_R, normalized);
-            } else if (current_state == CALIBRATE_WHITE_START || current_state == CALIBRATE_BLACK_START) {
-                g_sensor_R = adc_read_avg(PIN_IR_RIGHT_ADC_CH, ADC_SMOOTH_SAMPLES);
-                printf("CALIBRATING... State: %s | Raw ADC: %u\n", g_current_ir_state, g_sensor_R);
-            } else {
-                 printf("STOPPED | State: %s | Dist: %.0f mm | L_RPM: %.0f | R_RPM: %.0f\n",
-                    g_current_ir_state, g_distance_travelled_mm, g_speed_left_rpm, g_speed_right_rpm);
-            }
-        }
+        //         printf("LINE: %-9s | Tgt_L:%6.1f Cur_L:%6.1f Pwr_L:%6.1f | Tgt_R:%6.1f Cur_R:%6.1f Pwr_R:%6.1f | ADC:%4u Norm:%.2f\n",
+        //             g_current_ir_state,
+        //             g_target_speed_left_tps, g_current_speed_left_tps, g_final_power_left,
+        //             g_target_speed_right_tps, g_current_speed_right_tps, g_final_power_right,
+        //             g_sensor_R, normalized);
+        //     } else if (current_state == CALIBRATE_WHITE_START || current_state == CALIBRATE_BLACK_START) {
+        //         g_sensor_R = adc_read_avg(PIN_IR_RIGHT_ADC_CH, ADC_SMOOTH_SAMPLES);
+        //         printf("CALIBRATING... State: %s | Raw ADC: %u\n", g_current_ir_state, g_sensor_R);
+        //     } else {
+        //          printf("STOPPED | State: %s | Dist: %.0f mm | L_RPM: %.0f | R_RPM: %.0f\n",
+        //             g_current_ir_state, g_distance_travelled_mm, g_speed_left_rpm, g_speed_right_rpm);
+        //     }
+        // }
 
         // --- 6. Yield to other tasks ---
         vTaskDelay(pdMS_TO_TICKS(CONTROL_LOOP_MS));
@@ -345,9 +347,8 @@ void main_control_task(__unused void *params) {
  */
 void imu_task(__unused void *params) {
     // --- Heading target setup ---
-    imu_pose_t pose;
-    imu_update(&pose);
-    float yaw_target = pose.yaw_deg;
+    imu_update((imu_pose_t *)&g_imu_pose);
+    float yaw_target = g_imu_pose.yaw_deg;
     printf("[HEADING] target = %.1f deg\r\n", yaw_target);
 
     // --- TODO: enable PID + motor trim later
@@ -363,9 +364,9 @@ void imu_task(__unused void *params) {
         sleep_ms(10);
 
         // --- Update IMU readings ---
-        imu_update(&pose);
+        imu_update((imu_pose_t *)&g_imu_pose);
 
-        float err  = heading_err_deg(yaw_target, pose.yaw_deg);
+        float err  = heading_err_deg(yaw_target, g_imu_pose.yaw_deg);
         float trim = pid_step(&pid, err, DT_SEC);
 
         // --- Simulated motor outputs (safe build) ---
@@ -383,30 +384,30 @@ void imu_task(__unused void *params) {
 
         // --- Debug output (console only) ---
         printf("[SIM] yaw_tgt=%.1f yaw=%.1f err=%6.1f trim=%6.1f  L=%.1f R=%.1f  | roll=%.1f pitch=%.1f\r\n",
-               yaw_target, pose.yaw_deg, err, trim, left, right,
-               pose.roll_deg, pose.pitch_deg);
+               yaw_target, g_imu_pose.yaw_deg, err, trim, left, right,
+               g_imu_pose.roll_deg, g_imu_pose.pitch_deg);
 
         // --- MQTT publish (~5 Hz) ---
-        if (absolute_time_diff_us(last_pub, get_absolute_time()) > MQTT_MS * 1000) {
-            last_pub = get_absolute_time();
-            if (mqtt_client_is_online(&mqtt_state)) {
-                mqtt_pub_imu_raw(
-                    &mqtt_state, pose.ax, pose.ay, pose.az,
-                    0, 0, 0,                // gyro not used yet
-                    pose.mx, pose.my, pose.mz
-                );
-                mqtt_pub_imu_filtered(
-                    &mqtt_state, pose.ax, pose.ay, pose.az,
-                    pose.roll_deg, pose.pitch_deg, pose.yaw_deg
-                );
-                printf("[PUB] robot/imu/raw & robot/imu/filtered sent\r\n");
-            } else {
-                printf("[MQTT] not connected yet...\r\n");
-            }
-        }
+        // if (absolute_time_diff_us(last_pub, get_absolute_time()) > MQTT_MS * 1000) {
+        //     last_pub = get_absolute_time();
+        //     if (mqtt_client_is_online(&mqtt_state)) {
+        //         mqtt_publish_imu_raw(
+        //             &mqtt_state, g_imu_pose.ax, g_imu_pose.ay, g_imu_pose.az,
+        //             0, 0, 0,                // gyro not used yet
+        //             g_imu_pose.mx, g_imu_pose.my, g_imu_pose.mz
+        //         );
+        //         mqtt_publish_imu_filtered(
+        //             &mqtt_state, g_imu_pose.ax, g_imu_pose.ay, g_imu_pose.az,
+        //             g_imu_pose.roll_deg, g_imu_pose.pitch_deg, g_imu_pose.yaw_deg
+        //         );
+        //         printf("[PUB] robot/imu/raw & robot/imu/filtered sent\r\n");
+        //     } else {
+        //         printf("[MQTT] not connected yet...\r\n");
+        //     }
+        // }
 
-        sleep_ms(1000 / LOOP_HZ);
-        tick_ms += (1000 / LOOP_HZ);
+        // sleep_ms(1000 / LOOP_HZ);
+        // tick_ms += (1000 / LOOP_HZ);
     }
 }
 
@@ -430,14 +431,44 @@ void network_task(__unused void *params) {
     }
     
     mqtt_client_start_mqtt(&mqtt_state);
-    uint32_t last_temp_publish_ms = to_ms_since_boot(get_absolute_time());
+    // uint32_t last_temp_publish_ms = to_ms_since_boot(get_absolute_time());
+    uint32_t last_speed_publish_ms = to_ms_since_boot(get_absolute_time());
     printf("MQTT connected and started. About to enter for loop.\n");
     for (;;) {
+        // mqtt_client_poll(&mqtt_state); 
+        // uint32_t now_ms = to_ms_since_boot(get_absolute_time());
+        // if (mqtt_client_is_online(&mqtt_state) && (now_ms - last_temp_publish_ms >= TEMP_PUBLISH_INTERVAL_MS)) {
+        //     last_temp_publish_ms = now_ms;
+        //     mqtt_client_publish_temperature(&mqtt_state);
+        // }
+        // vTaskDelay(pdMS_TO_TICKS(100));
+
         mqtt_client_poll(&mqtt_state); 
-        uint32_t now_ms = to_ms_since_boot(get_absolute_time());
-        if (mqtt_client_is_online(&mqtt_state) && (now_ms - last_temp_publish_ms >= TEMP_PUBLISH_INTERVAL_MS)) {
-            last_temp_publish_ms = now_ms;
-            mqtt_client_publish_temperature(&mqtt_state);
+        uint32_t now_ms2 = to_ms_since_boot(get_absolute_time());
+        if (mqtt_client_is_online(&mqtt_state) && (now_ms2 - last_speed_publish_ms >= SPEED_PUBLISH_INTERVAL_MS)) {
+            last_speed_publish_ms = now_ms2;
+            mqtt_publish_speed(&mqtt_state, (const char *)g_current_ir_state,
+                                g_target_speed_left_tps, g_current_speed_left_tps, g_final_power_left,
+                                g_target_speed_right_tps, g_current_speed_right_tps, g_final_power_right, g_sensor_R);
+            mqtt_publish_obstacle(&mqtt_state, 30, 7, "LEFT");
+            const char* state_str = current_state == 0 ? "NOT_CALIBRATED" :
+                                    current_state == 1 ? "CALIBRATE_WHITE_START" :
+                                    current_state == 2 ? "CALIBRATE_WHITE_END" :
+                                    current_state == 3 ? "CALIBRATE_BLACK_START" :
+                                    current_state == 4 ? "CALIBRATED_STOPPED" :
+                                    current_state == 5 ? "LINE_FOLLOW_SINGLE" : "UNKNOWN";
+            mqtt_publish_state(&mqtt_state, state_str, state_str, "STOPPED");
+            mqtt_publish_line(&mqtt_state, 1, 0.2, 0.4);
+            mqtt_publish_barcode(&mqtt_state, "LEFT");
+            // mqtt_publish_imu_raw(
+            //         &mqtt_state, g_imu_pose.ax, g_imu_pose.ay, g_imu_pose.az,
+            //         0, 0, 0,                // gyro not used yet
+            //         g_imu_pose.mx, g_imu_pose.my, g_imu_pose.mz
+            //     );
+            // mqtt_publish_imu_filtered(
+            //     &mqtt_state, g_imu_pose.ax, g_imu_pose.ay, g_imu_pose.az,
+            //     g_imu_pose.roll_deg, g_imu_pose.pitch_deg, g_imu_pose.yaw_deg
+            // );
         }
         vTaskDelay(pdMS_TO_TICKS(100));
     }
@@ -456,18 +487,18 @@ void vLaunch(void) {
     encoder_init();  // <-- This now ONLY sets pin directions
 
     // Set up IMU
-    setvbuf(stdout, NULL, _IONBF, 0);
-    printf("\r\n=== IMU-assisted Straight Drive (build-safe version, MQTT enabled) ===\r\n");
+    // setvbuf(stdout, NULL, _IONBF, 0);
+    // printf("\r\n=== IMU-assisted Straight Drive (build-safe version, MQTT enabled) ===\r\n");
 
-    // --- I2C + IMU init
-    imu_init_i2c0_gp0_gp1();
-    if (!lsm303dlhc_init()) {
-        printf("IMU init failed (WHO_AM_I != 0x33)\r\n");
-        while (1) sleep_ms(1000);
-    }
-    printf("[IMU] Bias calibration... keep still.\r\n");
-    imu_calibrate_bias();
-    imu_set_accel_ema_alpha(0.12f);
+    // // --- I2C + IMU init
+    // imu_init_i2c0_gp0_gp1();
+    // if (!lsm303dlhc_init()) {
+    //     printf("IMU init failed (WHO_AM_I != 0x33)\r\n");
+    //     while (1) sleep_ms(1000);
+    // }
+    // printf("[IMU] Bias calibration... keep still.\r\n");
+    // imu_calibrate_bias();
+    // imu_set_accel_ema_alpha(0.12f);
     
     // --- 2. Setup Buttons ---
     gpio_init(BUTTON_MODE_CALIBRATE);
@@ -492,7 +523,7 @@ void vLaunch(void) {
     // --- 5. Create Tasks ---
     xTaskCreate(network_task, "NetworkTask", 2048, NULL, NETWORK_TASK_PRIORITY, NULL);
     xTaskCreate(main_control_task, "MainControlTask", 1024, NULL, MAIN_CONTROL_TASK_PRIORITY, NULL);
-    xTaskCreate(imu_task, "IMUTask", 1024, NULL, IMU_TASK_PRIORITY, NULL);
+    // xTaskCreate(imu_task, "IMUTask", 1024, NULL, IMU_TASK_PRIORITY, NULL);
 
     // --- 6. Start the Scheduler ---
     printf("Starting FreeRTOS scheduler\n");
