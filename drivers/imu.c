@@ -6,9 +6,9 @@
 #include "hardware/gpio.h"
 
 // -------- I2C & LSM303DLHC addresses / regs --------
-#define I2C_PORT      i2c0
-#define PIN_SDA       0
-#define PIN_SCL       1
+#define I2C_PORT      i2c1  
+#define PIN_SDA       2
+#define PIN_SCL       3
 
 // Accel (LSM303DLHC)
 #define LSM303_ACC_ADDR   0x19
