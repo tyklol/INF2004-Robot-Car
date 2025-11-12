@@ -18,6 +18,9 @@ typedef struct {
     bool  d_init;         // derivative state initialized?
 } pid_state_t;
 
+/** Clamp float to [lo, hi]. */
+float clampf(float x, float lo, float hi);
+
 /**
  * Initialize PID controller.
  * d_tau_s: 0 for raw derivative, else typical 0.02–0.05 s.
