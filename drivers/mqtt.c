@@ -454,6 +454,33 @@ void mqtt_pub_imu_filtered(MQTT_CLIENT_DATA_T *client_data, float fax, float fay
     }
 }
 
+void mqtt_pub_speed(MQTT_CLIENT_DATA_T *client_data, int g_current_scenario, const char *g_current_ir_state,
+                       float g_target_power_left, float g_target_power_right,
+                       float local_distance_cm, uint32_t g_current_lost_time_ms, int32_t g_total_ticks_left, int32_t g_total_ticks_right) {
+    char buf[192];
+    int n = snprintf(buf, sizeof(buf),
+        "{\"SCEN\": %d, \"IR_State\": \"%s\", \"Pwr_L\": %.1f, \"Pwr_R\": %.1f, \"Dist\": %.1fcm, \"L_ms\": %u, \"Ticks_L\": %d, \"Ticks_R\": %d}",
+         g_current_scenario, g_current_ir_state,
+                       g_target_power_left, g_target_power_right,
+                       local_distance_cm, g_current_lost_time_ms, g_total_ticks_left, g_total_ticks_right);
+    if (n <= 0 || n >= (int)sizeof(buf)) {
+        printf("mqtt_pub_speed: snprintf error or buffer too small\n");
+    } else {
+        mqtt_client_publish(client_data, "robot/speed", buf);
+    }
+}
+
+void mqtt_pub_obstacle(MQTT_CLIENT_DATA_T *client_data, float distance_cm, float width_cm) {
+    char buf[128];
+    int n = snprintf(buf, sizeof(buf),
+        "{\"distance_cm\": %.1f, \"width_cm\": %.1f}",
+        distance_cm, width_cm);
+    if (n <= 0 || n >= (int)sizeof(buf)) {
+        printf("mqtt_pub_obstacle: snprintf error or buffer too small\n");
+    } else {
+        mqtt_client_publish(client_data, "robot/obstacle", buf);
+    }
+}
 /* Thin wrappers for publish/subscribe/disconnect */
 
 void mqtt_client_publish(MQTT_CLIENT_DATA_T *client_data, const char *topic, const char *data) {

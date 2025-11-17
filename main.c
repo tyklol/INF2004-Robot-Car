@@ -8,14 +8,12 @@
 // FreeRTOS includes
 #include "FreeRTOS.h"
 #include "task.h"
-#include "semphr.h"
 
 // Your driver includes
 #include "drivers/motor.h"
 #include "drivers/ir.h"      
 #include "drivers/mqtt.h"    
 #include "drivers/encoder.h" 
-#include "drivers/ultrasonic.c" 
 
 // --- Pin Definitions for Buttons ---
 #define BUTTON_MODE_CALIBRATE   21
@@ -31,12 +29,10 @@
 #define PRINT_DELAY_MS     100    
 #define CONTROL_LOOP_MS    10     
 #define TEMP_PUBLISH_INTERVAL_MS 1000 
-#define OBSTACLE_STOP_CM 15.0f // <-- NEW: Stop if closer than 15cm
 
 // --- Task Priorities ---
 #define MAIN_CONTROL_TASK_PRIORITY (tskIDLE_PRIORITY + 2UL)
 #define NETWORK_TASK_PRIORITY      (tskIDLE_PRIORITY + 1UL)
-#define ULTRASONIC_TASK_PRIORITY   (tskIDLE_PRIORITY + 1UL)
 
 // --- State Machine ---
 typedef enum {
@@ -71,9 +67,7 @@ int32_t g_total_ticks_left = 0;
 int32_t g_total_ticks_right = 0;
 
 static MQTT_CLIENT_DATA_T mqtt_state;
-// --- NEW: Shared Globals for Ultrasonic ---
-float g_ultrasonic_distance_cm = -1.0f; // -1.0 = invalid/no reading
-SemaphoreHandle_t g_distance_mutex;
+
 /**
  * @brief Blinks the onboard LED to indicate the current scenario.
  * State 0 = 1 blink, State 1 = 2 blinks, ..., State 3 = 4 blinks.
@@ -216,105 +210,7 @@ void gpio_interrupt_handler(uint gpio, uint32_t events) {
         needs_update = true;
     }
 }
-float scan_for_width_rtos(float center_distance) {
-    float left_angle = 90.0;
-    float right_angle = 90.0;
-    float current_distance;
-    
-    // --- 1. Scan Left (90 down to 0) ---
-    printf("  Scanning left...\n");
-    for (float angle = 90; angle >= 0; angle -= 2) {
-        set_servo_angle(angle);
-        vTaskDelay(pdMS_TO_TICKS(40)); // Give servo time to move (RTOS-safe)
-        
-        current_distance = get_distance();
-        printf("    Angle: %.1f, Dist: %.2f\n", angle, current_distance);
 
-        // --- Safely write distance to global variable ---
-        if (xSemaphoreTake(g_distance_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-            g_ultrasonic_distance_cm = current_distance;
-            xSemaphoreGive(g_distance_mutex);
-        }
-
-        if (current_distance > (center_distance + 5.0) || current_distance < 0) {
-            left_angle = angle + 2;
-            break; 
-        }
-        if (angle == 0) { left_angle = 0; }
-    }
-    printf("  Left edge found at approx: %.1f deg\n", left_angle);
-
-    // --- 2. Scan Right (90 up to 180) ---
-    printf("  Scanning right...\n");
-    for (float angle = 90; angle <= 180; angle += 2) {
-        set_servo_angle(angle);
-        vTaskDelay(pdMS_TO_TICKS(40)); // RTOS-safe
-        
-        current_distance = get_distance();
-        printf("    Angle: %.1f, Dist: %.2f\n", angle, current_distance);
-
-        // --- Safely write distance to global variable ---
-        if (xSemaphoreTake(g_distance_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-            g_ultrasonic_distance_cm = current_distance;
-            xSemaphoreGive(g_distance_mutex);
-        }
-        
-        if (current_distance > (center_distance + 5.0) || current_distance < 0) {
-            right_angle = angle - 2;
-            break;
-        }
-         if (angle == 180) { right_angle = 180; }
-    }
-    printf("  Right edge found at approx: %.1f deg\n", right_angle);
-
-    // --- 3. Reset to center ---
-    set_servo_angle(90);
-    printf("  Scan complete. Resetting to center.\n");
-    vTaskDelay(pdMS_TO_TICKS(100)); // RTOS-safe
-
-    // --- 4. Calculate and return width ---
-    return calculate_width(center_distance, left_angle, right_angle);
-}
-void ultrasonic_task(__unused void *params) {
-    printf("Ultrasonic task started.\n");
-    set_servo_angle(90);
-    printf("Servo centered. Waiting 1s to settle.\n");
-    vTaskDelay(pdMS_TO_TICKS(1000)); // Wait for servo to get to position
-
-    // This is the main loop for the task
-    for (;;) {
-        
-        // 1. Check distance straight ahead
-        float distance = get_distance();
-        printf("Center distance: %.2f cm\n", distance);
-
-        // --- Safely write distance to global variable ---
-        if (xSemaphoreTake(g_distance_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-            g_ultrasonic_distance_cm = distance;
-            xSemaphoreGive(g_distance_mutex);
-        }
-
-        // 2. If object is close, scan for it
-        if (distance < THRESHOLD_DISTANCE && distance > 0) {
-            printf("Obstacle detected! Scanning for width...\n");
-            
-            float width = scan_for_width_rtos(distance); // Call RTOS-safe version
-            
-            printf("\n--------------------------------------\n");
-            printf(">>> OBSTACLE WIDTH: %.2f cm <<<\n", width);
-            printf("--------------------------------------\n\n");
-            
-            // Wait 3 seconds before checking again
-            vTaskDelay(pdMS_TO_TICKS(3000));
-        } else {
-            // No object found, just wait a bit before next check
-            vTaskDelay(pdMS_TO_TICKS(200));
-        }
-    }
-}
-/**
- * @brief TASK 1: Handles all high-frequency robot control logic.
- */
 /**
  * @brief TASK 1: Handles all high-frequency robot control logic.
  */
@@ -322,22 +218,14 @@ void main_control_task(__unused void *params) {
     vTaskDelay(pdMS_TO_TICKS(500));
     printf("Main control task started (4-Mode Tuning Ready).\n");
 
-    float local_distance_cm = -1.0f; // Local variable for distance
-    
     for (;;) {
-        // --- Safely read the shared distance ---
-        if (xSemaphoreTake(g_distance_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
-            local_distance_cm = g_ultrasonic_distance_cm;
-            xSemaphoreGive(g_distance_mutex);
-        }
-
-        // --- Encoder poll (unchanged) ---
+        // (Encoder poll unchanged)
         int32_t delta_ticks_left, delta_ticks_right;
         encoder_update_and_get_ticks(&delta_ticks_left, &delta_ticks_right);
         g_total_ticks_left = encoder_get_total_ticks_left();
         g_total_ticks_right = encoder_get_total_ticks_right();
 
-        // --- State change logic (unchanged) ---
+        // (State change logic unchanged)
         if (needs_update) {
             needs_update = false;
             encoder_reset_total_ticks();
@@ -372,39 +260,21 @@ void main_control_task(__unused void *params) {
             }
 
             if (g_is_calibrated) {
-                // This will now apply Scenario 0 when an obstacle is hit
                 apply_scenario_tune(g_current_scenario);
                 indicate_state_led(g_current_scenario);
             }
         }
 
-        // --- MODIFIED: Calculate Target Motor Power ---
+        // --- Calculate Target Motor Power ---
         if (g_current_scenario > 0 && g_is_calibrated) { // Scenarios 1, 2, or 3
             
-            // --- UPDATED: Obstacle Avoidance Logic ---
-            if (local_distance_cm > 0.0f && local_distance_cm < OBSTACLE_STOP_CM) {
-                // Obstacle detected! Stop the robot.
-                g_target_power_left = 0.0f;
-                g_target_power_right = 0.0f;
-                g_current_lost_time_ms = 0; 
-                g_current_ir_state = "OBSTACLE";
-
-                // --- NEW: Set scenario to 0 (STOPPED) ---
-                if (g_current_scenario != 0) {
-                    g_current_scenario = 0;
-                    needs_update = true; // Trigger a state update to apply scenario 0
-                }
-
-            } else {
-                // No obstacle, follow the line as normal
-                ir_follow_line_single(g_line_follow_power,
-                                    &g_target_power_left, 
-                                    &g_target_power_right,
-                                    &g_sensor_R,
-                                    &g_current_ir_state,
-                                    &g_current_lost_time_ms);
-            }
-            
+            // --- MODIFIED: Add new argument for lost time ---
+            ir_follow_line_single(g_line_follow_power,
+                                  &g_target_power_left, 
+                                  &g_target_power_right,
+                                  &g_sensor_R,
+                                  &g_current_ir_state,
+                                  &g_current_lost_time_ms); // <-- NEW
         } else { // Scenario 0 (STOP) or not calibrated
             g_target_power_left = 0.0f;
             g_target_power_right = 0.0f;
@@ -415,20 +285,29 @@ void main_control_task(__unused void *params) {
         motor_set_speed(MOTOR_LEFT, g_target_power_left);
         motor_set_speed(MOTOR_RIGHT, g_target_power_right);
 
-        // --- Print Debugging Information (unchanged) ---
+        // --- Print Debugging Information ---
         uint32_t now_ms = to_ms_since_boot(get_absolute_time());
         if (now_ms - g_last_print_time > PRINT_DELAY_MS) {
             g_last_print_time = now_ms;
             
             if (g_current_scenario > 0) {
-                printf("SCEN %d: %-10s| Pwr_L:%6.1f Pwr_R:%6.1f | Dist: %5.1f cm | L_ms:%5u\n",
-                       g_current_scenario, g_current_ir_state,
-                       g_target_power_left, g_target_power_right,
-                       local_distance_cm, g_current_lost_time_ms);
+                // --- MODIFIED: Added L_ms (Lost Time in ms) ---
+                printf("SCEN %d: %-10s| Pwr_L:%6.1f Pwr_R:%6.1f | Tick_L:%6ld Tick_R:%6ld | ADC:%4u | L_ms:%5u\n",
+                       g_current_scenario,
+                       g_current_ir_state,
+                       g_target_power_left,
+                       g_target_power_right,
+                       g_total_ticks_left,
+                       g_total_ticks_right,
+                       g_sensor_R,
+                       g_current_lost_time_ms); // <-- NEW
             } else {
-                 printf("STOPPED | State: %-10s| Dist: %5.1f cm | ADC:%4u | L_ms:%5u\n",
-                       g_current_ir_state, local_distance_cm,
-                       ir_read_single_sensor_raw(), g_current_lost_time_ms);
+                 printf("STOPPED | State: %-10s| Tick_L:%6ld Tick_R:%6ld | ADC:%4u | L_ms:%5u\n",
+                       g_current_ir_state,
+                       g_total_ticks_left,
+                       g_total_ticks_right,
+                       ir_read_single_sensor_raw(),
+                       g_current_lost_time_ms); // <-- NEW
             }
         }
 
@@ -470,8 +349,6 @@ void vLaunch(void) {
     motor_init();
     ir_init();      
     encoder_init(); 
-    ultrasonic_init();
-    servo_init();
     gpio_init(BUTTON_MODE_CALIBRATE);
     gpio_set_dir(BUTTON_MODE_CALIBRATE, GPIO_IN);
     gpio_pull_up(BUTTON_MODE_CALIBRATE);
@@ -482,16 +359,9 @@ void vLaunch(void) {
     gpio_set_irq_enabled(BUTTON_MODE_START_STOP, GPIO_IRQ_EDGE_FALL, true);
     motor_set_speed(MOTOR_LEFT, 0.0f);
     motor_set_speed(MOTOR_RIGHT, 0.0f);
-    g_distance_mutex = xSemaphoreCreateMutex();
-    if (g_distance_mutex == NULL) {
-        printf("!!! ERROR: Failed to create distance mutex!\n");
-        // Loop forever if mutex creation fails
-        for (;;) { vTaskDelay(pdMS_TO_TICKS(1000)); }
-    }
     printf("Mode: STATIONARY. Press GP21 to start calibration.\n");
     xTaskCreate(network_task, "NetworkTask", 2048, NULL, NETWORK_TASK_PRIORITY, NULL);
     xTaskCreate(main_control_task, "MainControlTask", 1024, NULL, MAIN_CONTROL_TASK_PRIORITY, NULL);
-    xTaskCreate(ultrasonic_task, "UltrasonicTask", 256, NULL, ULTRASONIC_TASK_PRIORITY, NULL);
     printf("Starting FreeRTOS scheduler\n");
     vTaskStartScheduler();
 }

@@ -1,0 +1,858 @@
+// #include "barcode.h"
+
+// #include <stdio.h>
+// #include <math.h>
+// #include <string.h>
+// #include "pico/stdlib.h"
+// #include "hardware/adc.h"
+// #include "hardware/gpio.h"
+
+// // ────────────────────────────────────────────────────────────────────────────────
+// // INTERNAL CONFIG
+// // ────────────────────────────────────────────────────────────────────────────────
+// #define RUN_Q_CAP 512
+// #define BIT_Q_CAP 1024
+// #define SEED_CAP 32
+// #define SEED_MIN 12
+// #define NW_FACTOR_NUM 18
+// #define NW_FACTOR_DEN 10
+// #define TRANSITION_HOLD_SAMPLES 3
+
+// #define WHITE_TIMEOUT_SEC 3
+// #define WHITE_TIMEOUT_SAMPLES (WHITE_TIMEOUT_SEC * BARCODE_SAMPLE_HZ)
+
+// // [Gemini] New: Total scan timeout
+// #define TOTAL_SCAN_TIMEOUT_SEC 10
+// #define TOTAL_SCAN_TIMEOUT_SAMPLES (TOTAL_SCAN_TIMEOUT_SEC * BARCODE_SAMPLE_HZ)
+
+// #define PRESEED_CAP 64
+
+// // ────────────────────────────────────────────────────────────────────────────────
+// // CODE 39 TABLE (bars/spaces, 9 elements, wide=1, narrow=0)
+// // Includes start/stop '*', space, digits, A–Z, and punctuation.
+// // ────────────────────────────────────────────────────────────────────────────────
+// typedef struct
+// {
+//     const char *bits;
+//     char ch;
+// } c39_t;
+
+// static const c39_t C39[] = {
+//     {"000110100", '0'},
+//     {"100100001", '1'},
+//     {"001100001", '2'},
+//     {"101100000", '3'},
+//     {"000110001", '4'},
+//     {"100110000", '5'},
+//     {"001110000", '6'},
+//     {"000100101", '7'},
+//     {"100100100", '8'},
+//     {"001100100", '9'},
+//     {"100001001", 'A'},
+//     {"001001001", 'B'},
+//     {"101001000", 'C'},
+//     {"000011001", 'D'},
+//     {"100011000", 'E'},
+//     {"001011000", 'F'},
+//     {"000001101", 'G'},
+//     {"100001100", 'H'},
+//     {"001001100", 'I'},
+//     {"000011100", 'J'},
+//     {"100000011", 'K'},
+//     {"001000011", 'L'},
+//     {"101000010", 'M'},
+//     {"000010011", 'N'},
+//     {"100010010", 'O'},
+//     {"001010010", 'P'},
+//     {"000000111", 'Q'},
+//     {"100000110", 'R'},
+//     {"001000110", 'S'},
+//     {"000010110", 'T'},
+//     {"110000001", 'U'},
+//     {"011000001", 'V'},
+//     {"111000000", 'W'},
+//     {"010010001", 'X'},
+//     {"110010000", 'Y'},
+//     {"011010000", 'Z'},
+//     {"010000101", '-'},
+//     {"110000100", '.'},
+//     {"011000100", ' '},
+//     {"010101000", '$'},
+//     {"010100010", '/'},
+//     {"010001010", '+'},
+//     {"000101010", "%"[0]},
+//     {"010010100", '*'}, // start/stop
+// };
+// static const size_t C39_N = sizeof(C39) / sizeof(C39[0]);
+
+// // ────────────────────────────────────────────────────────────────────────────────
+// // INTERNAL STATE
+// // ────────────────────────────────────────────────────────────────────────────────
+// static struct
+// {
+//     // calibration
+//     uint16_t white_avg, black_avg;
+//     uint16_t white_std, black_std;
+//     bool inverted;
+
+//     // thresholds (derived, in "logical" post-invert domain)
+//     uint16_t mid, hys, thr_black, thr_white;
+
+//     // runtime BW + pacing
+//     uint16_t last_adc;
+//     bw_t last_bw;
+//     bool has_bw;
+//     absolute_time_t next_tick;
+
+//     // current run accumulation
+//     bw_t cur_tone;
+//     uint16_t cur_len;
+//     bool have_run;
+
+//     // pending transition debounce
+//     bw_t pend_tone;
+//     uint16_t pend_len;
+
+//     // run queue
+//     run_t run_q[RUN_Q_CAP];
+//     uint16_t run_q_head, run_q_tail;
+
+//     // bit queue (element width: 0=narrow,1=wide) and whether that element is a bar/space
+//     uint8_t bit_q[BIT_Q_CAP], bit_is_bar[BIT_Q_CAP];
+//     uint16_t bit_q_head, bit_q_tail;
+
+//     // seeding for N/W classification
+//     uint16_t seed_len[SEED_CAP];
+//     uint16_t seed_cnt;
+//     bool seeded;
+//     uint16_t narrow_base;
+//     uint16_t wide_threshold;
+
+//     // pre-seed buffer (Option B)
+//     run_t preseed_runs[PRESEED_CAP];
+//     uint16_t preseed_cnt;
+//     bool preseed_started;
+
+//     // end-of-scan
+//     uint16_t white_consec;
+//     bool dumped_this_scan;
+//     uint16_t total_scan_samples; // [Gemini] Total scan timeout timer
+
+//     // Final bitstream (string) built as bits are produced
+//     char bit_line[600];
+//     uint16_t bit_len;
+
+//     // Phase 6–7 results (for printing/optional external use)
+//     char last_syms[64];      // e.g., "*Z*"
+//     char last_payload[60]; // e.g., "Z" (payload between the stars)
+//     char last_cmd[8];        // "LEFT"/"RIGHT"/"NONE"
+// } S;
+
+// // ────────────────────────────────────────────────────────────────────────────────
+// static inline uint16_t u16_clip_i32(int32_t v)
+// {
+//     if (v < 0)
+//         return 0;
+//     if (v > 4095)
+//         return 4095;
+//     return (uint16_t)v;
+// }
+// uint16_t barcode_read_adc_raw(void) { return adc_read(); }
+// uint16_t barcode_last_adc(void) { return S.last_adc; }
+// bw_t barcode_last_bw(void) { return S.last_bw; }
+
+// // ────────────────────────────────────────────────────────────────────────────────
+// // INIT & CALIBRATION
+// // ────────────────────────────────────────────────────────────────────────────────
+// static void reset_queues_and_run(void)
+// {
+//     S.run_q_head = S.run_q_tail = 0;
+//     S.bit_q_head = S.bit_q_tail = 0;
+//     S.have_run = false;
+//     S.cur_len = 0;
+//     S.seed_cnt = 0;
+//     S.seeded = false;
+//     S.narrow_base = 0;
+//     S.wide_threshold = 0;
+//     S.pend_len = 0;
+//     S.preseed_cnt = 0;
+//     S.preseed_started = false;
+//     S.white_consec = 0;
+//     S.dumped_this_scan = false;
+//     S.bit_len = 0;
+//     S.bit_line[0] = '\0';
+//     S.last_syms[0] = '\0';
+//     S.last_payload[0] = '\0';
+//     S.last_cmd[0] = '\0';
+//     S.total_scan_samples = 0; // [Gemini] Reset total scan timer
+// }
+// void barcode_init(void)
+// {
+//     adc_init();
+//     adc_gpio_init(BARCODE_ADC_GPIO);
+//     adc_select_input(BARCODE_ADC_CH);
+//     gpio_init(BARCODE_BTN_BLACK);
+//     gpio_pull_up(BARCODE_BTN_BLACK);
+//     gpio_set_dir(BARCODE_BTN_BLACK, GPIO_IN);
+
+//     // Defaults until calibration
+//     S.white_avg = 3900;
+//     S.black_avg = 3600;
+//     S.white_std = 20;
+//     S.black_std = 20;
+//     S.inverted = (S.black_avg > S.white_avg);
+//     uint16_t std_max = (S.white_std > S.black_std) ? S.white_std : S.black_std;
+//     uint16_t w_avg = S.inverted ? (uint16_t)(4095 - S.white_avg) : S.white_avg;
+//     uint16_t b_avg = S.inverted ? (uint16_t)(4095 - S.black_avg) : S.black_avg;
+//     S.mid = (uint16_t)((w_avg + b_avg) / 2);
+//     S.hys = std_max;
+//     S.thr_black = u16_clip_i32((int32_t)S.mid - (int32_t)S.hys);
+//     S.thr_white = u16_clip_i32((int32_t)S.mid + (int32_t)S.hys);
+//     S.has_bw = false;
+//     S.last_adc = 0;
+//     reset_queues_and_run();
+//     S.next_tick = make_timeout_time_ms(0);
+// }
+
+// static void capture_stats_ms(uint32_t dur_ms, uint16_t *avg, uint16_t *std)
+// {
+//     const uint32_t N = dur_ms * BARCODE_SAMPLE_HZ / 1000u;
+//     if (!N)
+//     {
+//         *avg = 0;
+//         *std = 0;
+//         return;
+//     }
+//     uint32_t sum = 0;
+//     for (uint32_t i = 0; i < N; ++i)
+//     {
+//         sum += barcode_read_adc_raw();
+//         sleep_us(1000000u / BARCODE_SAMPLE_HZ);
+//     }
+//     uint16_t mean = (uint16_t)(sum / N);
+//     uint64_t acc2 = 0;
+//     for (uint32_t i = 0; i < N; ++i)
+//     {
+//         int32_t d = (int32_t)barcode_read_adc_raw() - (int32_t)mean;
+//         acc2 += (uint64_t)(d * d);
+//         sleep_us(1000000u / BARCODE_SAMPLE_HZ);
+//     }
+//     uint32_t var = (uint32_t)(acc2 / N);
+//     uint16_t sdev = (uint16_t)(sqrt((double)var) + 0.5);
+//     *avg = mean;
+//     *std = sdev;
+// }
+// static void wait_for_button_press_and_release_ms(uint32_t hold_ms)
+// {
+//     while (gpio_get(BARCODE_BTN_BLACK))
+//     {
+//         tight_loop_contents();
+//     }
+//     absolute_time_t t_end = make_timeout_time_ms(hold_ms);
+//     while (!time_reached(t_end))
+//     {
+//         if (gpio_get(BARCODE_BTN_BLACK))
+//         {
+//             return wait_for_button_press_and_release_ms(hold_ms);
+//         }
+//         tight_loop_contents();
+//     }
+//     while (!gpio_get(BARCODE_BTN_BLACK))
+//     {
+//         tight_loop_contents();
+//     }
+// }
+// void barcode_calibrate(void)
+// {
+//     printf("Capturing WHITE for 1000 ms...\n");
+//     capture_stats_ms(1000, &S.white_avg, &S.white_std);
+//     printf("\nNow place sensor over BLACK line.\n");
+//     printf("Press GP%d and hold for 1s, then release.\n", BARCODE_BTN_BLACK);
+//     printf("Waiting for press...\n");
+//     wait_for_button_press_and_release_ms(1000);
+//     capture_stats_ms(500, &S.black_avg, &S.black_std);
+
+//     S.inverted = (S.black_avg > S.white_avg);
+//     uint16_t w_avg = S.inverted ? (uint16_t)(4095 - S.white_avg) : S.white_avg;
+//     uint16_t b_avg = S.inverted ? (uint16_t)(4095 - S.black_avg) : S.black_avg;
+//     uint16_t std_max = (S.white_std > S.black_std) ? S.white_std : S.black_std;
+//     S.mid = (uint16_t)((w_avg + b_avg) / 2);
+//     S.hys = std_max;
+//     S.thr_black = u16_clip_i32((int32_t)S.mid - (int32_t)S.hys);
+//     S.thr_white = u16_clip_i32((int32_t)S.mid + (int32_t)S.hys);
+
+//     printf("\nCalibration done.\n");
+//     printf("WHITE avg=%u std=%u\n", S.white_avg, S.white_std);
+//     printf("BLACK avg=%u std=%u\n", S.black_avg, S.black_std);
+//     printf("Polarity: %s\n", S.inverted ? "INVERTED (using 4095 - ADC)" : "NORMAL");
+//     printf("Mid=%u  Hys=%u  -> thr_black<=%u  thr_white>=%u\n", S.mid, S.hys, S.thr_black, S.thr_white);
+
+//     if ((S.mid - S.hys) >= (S.mid + S.hys))
+//     {
+//         printf("WARN: Weak separation (BLK+HYS >= WHT-HYS). Consider re-calibrating or lowering sensor height.\n");
+//     }
+//     S.has_bw = false;
+//     reset_queues_and_run();
+// }
+
+// // ────────────────────────────────────────────────────────────────────────────────
+// // HYSTERESIS + QUEUES
+// // ────────────────────────────────────────────────────────────────────────────────
+// static bw_t classify_with_hysteresis(uint16_t v)
+// {
+//     if (!S.has_bw)
+//     {
+//         bw_t s0 = (v <= S.mid) ? BW_BLACK : BW_WHITE;
+//         S.has_bw = true;
+//         return s0;
+//     }
+//     if (S.last_bw == BW_WHITE)
+//     {
+//         if (v <= S.thr_black)
+//             return BW_BLACK;
+//         return BW_WHITE;
+//     }
+//     else
+//     {
+//         if (v >= S.thr_white)
+//             return BW_WHITE;
+//         return BW_BLACK;
+//     }
+// }
+// static inline bool run_q_push(run_t r)
+// {
+//     uint16_t nhead = (S.run_q_head + 1) % RUN_Q_CAP;
+//     if (nhead == S.run_q_tail)
+//         return false;
+//     S.run_q[S.run_q_head] = r;
+//     S.run_q_head = nhead;
+//     return true;
+// }
+// bool barcode_get_next_run(run_t *out)
+// {
+//     if (S.run_q_head == S.run_q_tail)
+//         return false;
+//     if (out)
+//         *out = S.run_q[S.run_q_tail];
+//     S.run_q_tail = (S.run_q_tail + 1) % RUN_Q_CAP;
+//     return true;
+// }
+// static inline bool bit_q_push(uint8_t bit, bool is_bar)
+// {
+//     uint16_t nhead = (S.bit_q_head + 1) % BIT_Q_CAP;
+//     if (nhead == S.bit_q_tail)
+//         return false;
+//     S.bit_q[S.bit_q_head] = bit;
+//     S.bit_is_bar[S.bit_q_head] = is_bar ? 1 : 0;
+//     S.bit_q_head = nhead;
+//     return true;
+// }
+// bool barcode_get_next_bit(uint8_t *bit, bool *is_bar)
+// {
+//     if (S.bit_q_head == S.bit_q_tail)
+//         return false;
+//     if (bit)
+//         *bit = S.bit_q[S.bit_q_tail];
+//     if (is_bar)
+//         *is_bar = S.bit_is_bar[S.bit_q_tail] ? true : false;
+//     S.bit_q_tail = (S.bit_q_tail + 1) % BIT_Q_CAP;
+//     return true;
+// }
+
+// // ────────────────────────────────────────────────────────────────────────────────
+// // SEEDING HELPERS
+// // ────────────────────────────────────────────────────────────────────────────────
+// static uint16_t median_u16(uint16_t *arr, uint16_t n)
+// {
+//     for (uint16_t i = 1; i < n; ++i)
+//     {
+//         uint16_t key = arr[i], j = i;
+//         while (j && arr[j - 1] > key)
+//         {
+//             arr[j] = arr[j - 1];
+//             --j;
+//         }
+//         arr[j] = key;
+//     }
+//     return arr[n / 2];
+// }
+// static void nw_add_seed(uint16_t len)
+// {
+//     if (S.seed_cnt == 0 && S.cur_tone == BW_WHITE && len > 1000)
+//     {
+//         return;
+//     } // ignore idle WHITE
+//     if (S.seed_cnt < SEED_CAP)
+//     {
+//         S.seed_len[S.seed_cnt++] = len;
+//     }
+//     if (!S.seeded && S.seed_cnt >= SEED_MIN)
+//     {
+//         uint16_t tmp[SEED_CAP];
+//         memcpy(tmp, S.seed_len, sizeof(uint16_t) * S.seed_cnt);
+//         uint16_t med = median_u16(tmp, S.seed_cnt);
+//         S.narrow_base = med;
+//         uint32_t thr = ((uint32_t)med * NW_FACTOR_NUM + (NW_FACTOR_DEN - 1)) / NW_FACTOR_DEN;
+//         S.wide_threshold = (uint16_t)thr;
+//         S.seeded = true;
+//         printf("[NW] Seeded with %u runs: narrow_base=%u samples, wide>=~%u (x%u/%u)\n",
+//                S.seed_cnt, S.narrow_base, S.wide_threshold, NW_FACTOR_NUM, NW_FACTOR_DEN);
+//     }
+// }
+// static uint8_t nw_classify(uint16_t len)
+// {
+//     if (!S.seeded)
+//         return 0;
+//     uint32_t lhs = (uint32_t)len * NW_FACTOR_DEN, rhs = (uint32_t)S.narrow_base * NW_FACTOR_NUM;
+//     return (lhs >= rhs) ? 1 : 0;
+// }
+// static inline void append_bit_to_line(uint8_t bit)
+// {
+//     if (S.bit_len + 1 < sizeof(S.bit_line))
+//     {
+//         S.bit_line[S.bit_len++] = bit ? '1' : '0';
+//         S.bit_line[S.bit_len] = '\0';
+//     }
+// }
+// static void backfill_preseed_bits(void)
+// {
+//     if (!S.seeded || S.preseed_cnt == 0)
+//         return;
+//     for (uint16_t i = 0; i < S.preseed_cnt; ++i)
+//     {
+//         run_t r = S.preseed_runs[i];
+//         uint8_t bit = (uint8_t)(((uint32_t)r.len * NW_FACTOR_DEN) >= ((uint32_t)S.narrow_base * NW_FACTOR_NUM));
+//         (void)bit_q_push(bit, (r.tone == BW_BLACK));
+//         append_bit_to_line(bit);
+//     }
+//     S.preseed_cnt = 0;
+// }
+// static void start_new_scan(void)
+// {
+//     S.preseed_started = false;
+//     S.preseed_cnt = 0;
+//     S.seed_cnt = 0;
+//     S.seeded = false;
+//     S.narrow_base = 0;
+//     S.wide_threshold = 0;
+//     S.run_q_head = S.run_q_tail = 0;
+//     S.bit_q_head = S.bit_q_tail = 0;
+//     S.bit_len = 0;
+//     S.bit_line[0] = '\0';
+//     S.white_consec = 0;
+//     S.dumped_this_scan = false;
+//     S.have_run = false;
+//     S.cur_len = 0;
+//     S.pend_len = 0;
+//     S.last_syms[0] = '\0';
+//     S.last_payload[0] = '\0';
+//     S.last_cmd[0] = '\0';
+//     S.total_scan_samples = 0; // [Gemini] Reset total scan timer
+// }
+
+// // ────────────────────────────────────────────────────────────────────────────────
+// // PHASE 5–7: Decoding helpers
+// // ────────────────────────────────────────────────────────────────────────────────
+// static int c39_lookup(const char *bits9)
+// {
+//     for (size_t i = 0; i < C39_N; ++i)
+//     {
+//         if (strcmp(C39[i].bits, bits9) == 0)
+//             return (int)i;
+//     }
+//     return -1;
+// }
+// static void reverse_str(char *s)
+// {
+//     size_t n = strlen(s);
+//     for (size_t i = 0; i < n / 2; ++i)
+//     {
+//         char t = s[i];
+//         s[i] = s[n - 1 - i];
+//         s[n - 1 - i] = t;
+//     }
+// }
+// // Consume exactly 9 bits starting at idx, verifying alternation BAR/SPACE starting on BAR.
+// // Returns 1 on success and writes bits9; returns 0 if not enough elements.
+// static int extract_symbol_9(const char *bits, const uint8_t *is_bar, size_t n, size_t *idx, char bits9[10])
+// {
+//     if (*idx + 9 > n)
+//         return 0;
+//     // Expect BAR at first element of a symbol
+//     if (!is_bar[*idx])
+//         return 0;
+//     for (int k = 0; k < 9; ++k)
+//     {
+//         if (((k % 2) == 0) != (is_bar[*idx + k] ? 1 : 0))
+//             return 0; // enforce bar/space alternation
+//         bits9[k] = bits[*idx + k];
+//     }
+//     bits9[9] = '\0';
+//     *idx += 9;
+//     // Optional: skip one narrow inter-character space if present (0 and a SPACE)
+//     if (*idx < n && !is_bar[*idx] && bits[*idx] == '0')
+//     {
+//         (*idx)++;
+//     }
+//     return 1;
+// }
+
+// static void classify_command_from_first_letter(char first, char *out)
+// {
+//     // RIGHT: A C E G I K M O Q S U W Y
+//     // LEFT : B D F H J L N P R T V X Z
+//     const char *R = "ACEGIKMOQSUWY";
+//     const char *L = "BDFHJLNPRTVXZ";
+//     if (strchr(R, first))
+//     {
+//         strcpy(out, "RIGHT");
+//         return;
+//     }
+//     if (strchr(L, first))
+//     {
+//         strcpy(out, "LEFT");
+//         return;
+//     }
+//     strcpy(out, "NONE");
+// }
+
+// static void decode_and_print(void)
+// {
+//     // Build a temporary copy of element arrays for parsing
+//     // (We will use the queues’ historical string + is_bar flags currently held in the queue)
+//     // NOTE: bit_line holds only bits, not is_bar flags, so we reconstruct is_bar by re-reading the queue window.
+//     // Simpler: during production we already pushed (bit, is_bar) in queues, and we did not clear them yet at dump time.
+
+//     // Snapshot current queue content
+//     uint16_t count = (S.bit_q_head >= S.bit_q_tail)
+//                          ? (S.bit_q_head - S.bit_q_tail)
+//                          : (BIT_Q_CAP - S.bit_q_tail + S.bit_q_head);
+//     if (count == 0)
+//     {
+//         S.last_syms[0] = '\0';
+//         S.last_payload[0] = '\0';
+//         S.last_cmd[0] = '\0';
+//         return;
+//     }
+
+//     static char bits_buf[BIT_Q_CAP + 1];
+//     static uint8_t bar_buf[BIT_Q_CAP];
+//     for (uint16_t k = 0; k < count; ++k)
+//     {
+//         uint16_t pos = (S.bit_q_tail + k) % BIT_Q_CAP;
+//         bits_buf[k] = S.bit_q[pos] ? '1' : '0';
+//         bar_buf[k] = S.bit_is_bar[pos];
+//     }
+//     bits_buf[count] = '\0';
+
+//     // Try forward then reverse
+//     char syms[64];
+//     syms[0] = '\0';
+//     char payload[60];
+//     payload[0] = '\0';
+
+//     for (int pass = 0; pass < 2; ++pass)
+//     {
+//         size_t i = 0;
+//         size_t out = 0;
+//         char curr_syms[64];
+//         curr_syms[0] = '\0';
+//         while (i < count)
+//         {
+//             char b9[10];
+//             size_t saved = i;
+//             if (!extract_symbol_9(bits_buf, bar_buf, count, &i, b9))
+//             {
+//                 // If not aligned on BAR, advance by 1 and retry
+//                 ++i;
+//                 continue;
+//             }
+//             int idx = c39_lookup(b9);
+//             if (idx < 0)
+//             {
+//                 i = saved + 1;
+//                 continue;
+//             }
+//             char ch = C39[idx].ch;
+//             size_t L = strlen(curr_syms);
+//             if (L + 1 < sizeof(curr_syms))
+//             {
+//                 curr_syms[L] = ch;
+//                 curr_syms[L + 1] = '\0';
+//             }
+//         }
+//         // must have at least *X* framing
+//         size_t Ls = strlen(curr_syms);
+//         if (Ls >= 2 && curr_syms[0] == '*' && curr_syms[Ls - 1] == '*')
+//         {
+//             strncpy(syms, curr_syms, sizeof(syms) - 1);
+//             syms[sizeof(syms) - 1] = '\0';
+//             // payload is inside
+//             size_t pl = Ls - 2;
+//             if (pl >= sizeof(payload))
+//                 pl = sizeof(payload) - 1;
+//             memcpy(payload, curr_syms + 1, pl);
+//             payload[pl] = '\0';
+//             break;
+//         }
+//         // reverse once then retry
+//         if (pass == 0)
+//         {
+//             reverse_str(bits_buf);
+//             // reverse is_bar as well
+//             for (uint16_t a = 0, b = count - 1; a < b; ++a, --b)
+//             {
+//                 uint8_t t = bar_buf[a];
+//                 bar_buf[a] = bar_buf[b];
+//                 bar_buf[b] = t;
+//             }
+//         }
+//     }
+
+//     // Save for accessors
+//     strncpy(S.last_syms, syms, sizeof(S.last_syms) - 1);
+//     S.last_syms[sizeof(S.last_syms) - 1] = '\0';
+//     strncpy(S.last_payload, payload, sizeof(S.last_payload) - 1);
+//     S.last_payload[sizeof(S.last_payload) - 1] = '\0';
+
+//     // Command by first payload letter (if any)
+//     if (S.last_payload[0])
+//     {
+//         classify_command_from_first_letter(S.last_payload[0], S.last_cmd);
+//     }
+//     else
+//     {
+//         S.last_cmd[0] = '\0';
+//     }
+
+//     // Print results
+//     if (S.last_syms[0])
+//         printf("SYMS: %s\n", S.last_syms);
+//     if (S.last_payload[0])
+//         printf("Decoded: %s\n", S.last_payload);
+//     if (S.last_cmd[0])
+//         printf("Command: %s\n", S.last_cmd[0] ? S.last_cmd : "NONE");
+//     else
+//         printf("Command: NONE\n");
+// }
+
+// // ────────────────────────────────────────────────────────────────────────────────
+// // STEP @ 300 Hz  → run segmentation & (if seeded) bit classification
+// // ────────────────────────────────────────────────────────────────────────────────
+// // [Gemini] Modified to accept encoder ticks to gate scanning
+// bool barcode_step_300hz(int32_t delta_ticks_left, int32_t delta_ticks_right)
+// {
+//     // Pace
+//     if (!time_reached(S.next_tick))
+//     {
+//         sleep_until(S.next_tick);
+//     }
+//     S.next_tick = delayed_by_us(get_absolute_time(), 1000000u / BARCODE_SAMPLE_HZ);
+
+//     // [Gemini] Check for motion
+//     bool is_moving = (delta_ticks_left != 0 || delta_ticks_right != 0);
+
+//     if (!is_moving)
+//     {
+//         // Not moving. If we were in the middle of a scan, abort it.
+//         if (S.preseed_started)
+//         {
+//             printf("[Barcode] Motion stopped. Aborting scan.\n");
+//             decode_and_print(); // Try to decode what we have
+//             start_new_scan();
+//         }
+//         // Reset white timeout, as we are effectively "idle"
+//         S.white_consec = 0;
+//         return true;
+//     }
+
+//     // --- [Gemini] If we are here, we are MOVING. Proceed with scan logic. ---
+
+//     // ADC & BW
+//     uint16_t raw = barcode_read_adc_raw();
+//     uint16_t v = S.inverted ? (uint16_t)(4095 - raw) : raw;
+//     bw_t bw = classify_with_hysteresis(v);
+//     S.last_adc = v;
+//     S.last_bw = bw;
+
+//     // [Gemini] Total scan timeout (if scan is in progress)
+//     if (S.preseed_started)
+//     {
+//         if (S.total_scan_samples < 0xFFFF)
+//             S.total_scan_samples++;
+        
+//         if (!S.dumped_this_scan && S.total_scan_samples >= TOTAL_SCAN_TIMEOUT_SAMPLES)
+//         {
+//             printf("[Barcode] TOTAL scan timeout (%d sec). Aborting.\n", TOTAL_SCAN_TIMEOUT_SEC);
+//             if (S.bit_len > 0)
+//             {
+//                 printf("BIT: %s\n", S.bit_line);
+//             }
+//             decode_and_print();
+//             S.dumped_this_scan = true;
+//             start_new_scan();
+//             return true; // Scan reset
+//         }
+//     }
+
+//     // WHITE timeout → end of scan
+//     if (bw == BW_WHITE)
+//     {
+//         if (S.white_consec < 0xFFFF)
+//             S.white_consec++;
+//         if (!S.dumped_this_scan && S.white_consec >= WHITE_TIMEOUT_SAMPLES)
+//         {
+//             if (S.preseed_started && S.bit_len > 0)
+//             {
+//                 printf("BIT: %s\n", S.bit_line);
+//             }
+
+//             // Phase 5–7: decode what we have
+//             decode_and_print();
+
+//             S.dumped_this_scan = true;
+//             start_new_scan();
+//             return true;
+//         }
+//     }
+//     else
+//     {
+//         S.white_consec = 0;
+//         S.dumped_this_scan = false;
+//     }
+
+//     // Debounced run accumulation
+//     if (!S.have_run)
+//     {
+//         S.cur_tone = bw;
+//         S.cur_len = 1;
+//         S.pend_len = 0;
+//         S.have_run = true;
+//     }
+//     else
+//     {
+//         if (bw == S.cur_tone)
+//         {
+//             S.pend_len = 0;
+//             if (S.cur_len < 0xFFFF)
+//                 S.cur_len++;
+//         }
+//         else
+//         {
+//             if (S.pend_len == 0)
+//             {
+//                 S.pend_tone = bw;
+//                 S.pend_len = 1;
+//             }
+//             else
+//             {
+//                 if (bw == S.pend_tone)
+//                 {
+//                     if (S.pend_len < 0xFFFF)
+//                         S.pend_len++;
+//                 }
+//                 else
+//                 {
+//                     S.pend_len = 0;
+//                 }
+//             }
+//             if (S.pend_len >= TRANSITION_HOLD_SAMPLES)
+//             {
+//                 // completed run
+//                 run_t r = {.tone = S.cur_tone, .len = S.cur_len};
+//                 (void)run_q_push(r);
+
+//                 // preseed buffering — begin at FIRST BLACK run; ignore idle WHITE
+//                 if (!S.seeded)
+//                 {
+//                     if (!S.preseed_started)
+//                     {
+//                         if (r.tone == BW_BLACK)
+//                         {
+//                             S.preseed_started = true;
+//                             S.total_scan_samples = 0; // [Gemini] Start total scan timer
+//                             S.bit_len = 0;
+//                             S.bit_line[0] = '\0'; // new scan summary starts here
+//                             if (S.preseed_cnt < PRESEED_CAP)
+//                                 S.preseed_runs[S.preseed_cnt++] = r;
+//                         }
+//                     }
+//                     else
+//                     {
+//                         if (S.preseed_cnt < PRESEED_CAP)
+//                             S.preseed_runs[S.preseed_cnt++] = r;
+//                     }
+//                 }
+
+//                 // seeding and bit production
+//                 bool was_seeded = S.seeded;
+//                 nw_add_seed(r.len);
+//                 bool became_seeded = (!was_seeded && S.seeded);
+//                 if (became_seeded)
+//                 {
+//                     backfill_preseed_bits(); // counts this run via preseed
+//                 }
+//                 else if (S.seeded)
+//                 {
+//                     uint8_t bit = nw_classify(r.len);
+//                     (void)bit_q_push(bit, (r.tone == BW_BLACK));
+//                     append_bit_to_line(bit);
+//                 }
+
+//                 // start new run with held samples
+//                 S.cur_tone = S.pend_tone;
+//                 S.cur_len = S.pend_len;
+//                 S.pend_len = 0;
+//             }
+//         }
+//     }
+//     return true;
+// }
+
+// // ────────────────────────────────────────────────────────────────────────────────
+// // INTROSPECTION + PHASE 6–7 Accessors
+// // ────────────────────────────────────────────────────────────────────────────────
+// void barcode_get_thresholds(uint16_t *thr_black, uint16_t *thr_white,
+//                             uint16_t *mid, uint16_t *hys,
+//                             uint16_t *white_avg, uint16_t *black_avg,
+//                             uint16_t *white_std, uint16_t *black_std,
+//                             bool *inverted)
+// {
+//     if (thr_black)
+//         *thr_black = S.thr_black;
+//     if (thr_white)
+//         *thr_white = S.thr_white;
+//     if (mid)
+//         *mid = S.mid;
+//     if (hys)
+//         *hys = S.hys;
+//     if (white_avg)
+//         *white_avg = S.white_avg;
+//     if (black_avg)
+//         *black_avg = S.black_avg;
+//     if (white_std)
+//         *white_std = S.white_std;
+//     if (black_std)
+//         *black_std = S.black_std;
+//     if (inverted)
+//         *inverted = S.inverted;
+// }
+// void barcode_get_nw_info(bool *seeded, uint16_t *narrow_base, uint16_t *wide_threshold,
+//                          uint16_t *factor_num, uint16_t *factor_den)
+// {
+//     if (seeded)
+//         *seeded = S.seeded;
+//     if (narrow_base)
+//         *narrow_base = S.narrow_base;
+//     if (wide_threshold)
+//         *wide_threshold = S.wide_threshold;
+//     if (factor_num)
+//         *factor_num = NW_FACTOR_NUM;
+//     if (factor_den)
+//         *factor_den = NW_FACTOR_DEN;
+// }
+
+// // Optional accessors (if you want them elsewhere)
+// const char *barcode_last_symbols(void) { return S.last_syms; }
+// const char *barcode_last_payload(void) { return S.last_payload; }
+// const char *barcode_last_command(void) { return S.last_cmd; }

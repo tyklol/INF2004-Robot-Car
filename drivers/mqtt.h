@@ -62,6 +62,11 @@ void mqtt_pub_imu_raw(MQTT_CLIENT_DATA_T *client_data, float ax, float ay, float
 void mqtt_pub_imu_filtered(MQTT_CLIENT_DATA_T *client_data, float fax, float fay, float faz,
                            float roll, float pitch, float yaw);
 
+void mqtt_pub_speed(MQTT_CLIENT_DATA_T *client_data, int g_current_scenario, const char *g_current_ir_state,
+    float g_target_power_left, float g_target_power_right,
+    float local_distance_cm, uint32_t g_current_lost_time_ms, int32_t g_total_ticks_left, int32_t g_total_ticks_right);
+
+    void mqtt_pub_obstacle(MQTT_CLIENT_DATA_T *client_data, float distance_cm, float width_cm);
 /* Publish arbitrary topic/data (wrapper). */
 void mqtt_client_publish(MQTT_CLIENT_DATA_T *client_data, const char *topic, const char *data);
 

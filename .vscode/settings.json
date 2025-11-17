@@ -14,6 +14,8 @@
         "altcp_tls.h": "c",
         "cyw43_arch.h": "c",
         "timer.h": "c",
-        "obstacle_detector.h": "c"
+        "obstacle_detector.h": "c",
+        "stdlib.h": "c",
+        "pwm.h": "c"
     }
 }
