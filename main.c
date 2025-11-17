@@ -38,6 +38,7 @@
 typedef enum {
     STATIONARY_NOT_CALIBRATED,
     CALIBRATE_WHITE_START, 
+    CALIBRATE_WHITE_END,
     CALIBRATE_BLACK_START, 
     CALIBRATED_STOPPED,    
 } RobotState;
@@ -192,6 +193,8 @@ void gpio_interrupt_handler(uint gpio, uint32_t events) {
             if (current_state == STATIONARY_NOT_CALIBRATED) {
                 current_state = CALIBRATE_WHITE_START;
             } else if (current_state == CALIBRATE_WHITE_START) {
+                current_state = CALIBRATE_WHITE_END;
+            } else if (current_state == CALIBRATE_WHITE_END) {
                 current_state = CALIBRATE_BLACK_START;
             } else if (current_state == CALIBRATE_BLACK_START) {
                 current_state = CALIBRATED_STOPPED;
@@ -241,8 +244,12 @@ void main_control_task(__unused void *params) {
                     g_current_ir_state = "CAL_WHITE";
                     printf("Mode: Place sensor on WHITE, press GP21 to save.\n");
                     break;
-                case CALIBRATE_BLACK_START:
+                case CALIBRATE_WHITE_END:
+                    g_current_ir_state = "CAL_WHITE";
                     g_calib_white = ir_read_single_sensor_raw();
+                    printf("Mode: Place sensor on WHITE, press GP21 to save.\n");
+                    break;
+                case CALIBRATE_BLACK_START:
                     g_current_ir_state = "CAL_BLACK";
                     printf("WHITE saved: %u. Place on BLACK, press GP21 to save.\n", g_calib_white);
                     break;

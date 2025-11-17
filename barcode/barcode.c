@@ -84,7 +84,7 @@ static const size_t C39_N = sizeof(C39) / sizeof(C39[0]);
 // ────────────────────────────────────────────────────────────────────────────────
 // INTERNAL STATE
 // ────────────────────────────────────────────────────────────────────────────────
-static struct
+static struct 
 {
     // calibration
     uint16_t white_avg, black_avg;
