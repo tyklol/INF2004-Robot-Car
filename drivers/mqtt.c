@@ -429,10 +429,8 @@ void mqtt_pub_imu_raw(MQTT_CLIENT_DATA_T *client_data, float ax, float ay, float
                       float mx, float my, float mz) {
     char buf[192];
     int n = snprintf(buf, sizeof(buf),
-        "{\"ax\":%.3f,\"ay\":%.3f,\"az\":%.3f,"
-        "\"gx\":%.3f,\"gy\":%.3f,\"gz\":%.3f,"
-        "\"mx\":%.3f,\"my\":%.3f,\"mz\":%.3f}",
-        ax, ay, az, gx, gy, gz, mx, my, mz);
+        "{\"ax\":%.3f,\"ay\":%.3f,\"az\":%.3f}",
+        ax, ay, az);
     if (n <= 0 || n >= (int)sizeof(buf)) {
         printf("mqtt_pub_imu_raw: snprintf error or buffer too small\n");
     } else {

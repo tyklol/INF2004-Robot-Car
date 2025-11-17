@@ -1,7 +1,7 @@
 #include "pid_controller.h"
 #include <float.h>
 
-static inline float clampf(float x, float lo, float hi) {
+float clampf(float x, float lo, float hi) {
     return (x < lo) ? lo : (x > hi) ? hi : x;
 }
 
@@ -43,6 +43,13 @@ float pid_calculate(pid_state_t *pid, float target, float current, float dt_s)
 
     // --- Error & P-term ---
     float error  = target - current;
+
+    if (error > 180.0f) {
+        error -= 360.0f;
+    } else if (error < -180.0f) {
+        error += 360.0f;
+    }
+
     float p_term = pid->kp * error;
 
     // --- Derivative on measurement (avoids setpoint kicks) ---

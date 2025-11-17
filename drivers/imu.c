@@ -1,319 +1,211 @@
-#include "imu.h"
-#include <math.h>
-#include <string.h>
+#include <stdio.h>
+#include <math.h> // <-- ADDED for atan2, sqrt, cos, sin
 #include "pico/stdlib.h"
 #include "hardware/i2c.h"
 #include "hardware/gpio.h"
 
-// -------- I2C & LSM303DLHC addresses / regs --------
-#define I2C_PORT      i2c1  
-#define PIN_SDA       2
-#define PIN_SCL       3
+/*
+ * This example reads and filters data from a GY-511 (LSM303DLHC)
+ * and calculates Pitch, Roll, and tilt-compensated Yaw (Heading).
+ */
 
-// Accel (LSM303DLHC)
-#define LSM303_ACC_ADDR   0x19
-#define WHO_AM_I_A        0x0F
-#define CTRL_REG1_A       0x20
-#define CTRL_REG4_A       0x23
-#define OUT_X_L_A         0x28   // auto-increment to X_H,Y_L,Y_H,Z_L,Z_H
+// --- NEW: I2C/IMU Definitions ---
+#define I2C_PORT i2c0
+#define I2C_SDA_PIN 2 // (Check your wiring - using GP2)
+#define I2C_SCL_PIN 3 // (Check your wiring - using GP3)
+#define ACCEL_ADDR 0x19
+#define MAG_ADDR 0x1E
 
-// Mag (LSM303DLHC)
-#define LSM303_MAG_ADDR   0x1E
-#define CRA_REG_M         0x00   // data rate config
-#define CRB_REG_M         0x01   // gain
-#define MR_REG_M          0x02   // mode (continuous)
-#define OUT_X_H_M         0x03   // then X_L, Z_H, Z_L, Y_H, Y_L
+// --- Filter Configuration ---
+const float ALPHA = 0.2; // Smoothing factor (smaller = more smoothing)
 
-// -------- internals --------
-static float a_alpha = 0.12f;          // EMA smoothing for accel
-static float ax_f, ay_f, az_f;         // filtered accel
-static bool  a_init = false;
+// --- Global Variables for Filter State ---
+float filtered_accel[3] = {0.0, 0.0, 0.0};
+float filtered_mag[3] = {0.0, 0.0, 0.0};
 
-static float a_bias_x=0, a_bias_y=0, a_bias_z=0;  // accel DC offsets (counts)
-static float m_bias_x=0, m_bias_y=0, m_bias_z=0;  // mag DC offsets (raw units)
-// Make these global or static global in imu.c
-static int16_t m_min_x = 32767, m_max_x = -32768;
-static int16_t m_min_y = 32767, m_max_y = -32768;
-static int16_t m_min_z = 32767, m_max_z = -32768;
-static imu_pose_t latest;
+// --- Function Prototypes ---
+void imu_init();
+void read_accel(int16_t accel[3]);
+void read_mag(int16_t mag[3]);
+void apply_ema_filter(int16_t raw_data[3], float filtered_data[3]);
+void calculate_angles(float accel[3], float mag[3], float *pitch_out, float *roll_out, float *yaw_out);
+float get_filtered_heading(float filtered_accel[3], float filtered_mag[3]);
 
-#ifndef M_PI
-#define M_PI 3.14159265358979323846
-#endif
-
-static float bx[32], by[32], bz[32];
-static int   N = 0, idx = 0, count = 0;
-static float sx = 0, sy = 0, sz = 0;
-
-void imu_lpf_init(int window) {
-    if (window < 1) window = 1;
-    if (window > 32) window = 32;
-    N = window; idx = 0; count = 0;
-    sx = sy = sz = 0;
-    memset(bx, 0, sizeof(bx));
-    memset(by, 0, sizeof(by));
-    memset(bz, 0, sizeof(bz));
-}
-
-void imu_lpf_push(float ax, float ay, float az) {
-    // subtract oldest
-    sx -= bx[idx]; sy -= by[idx]; sz -= bz[idx];
-    // insert newest
-    bx[idx] = ax;  by[idx] = ay;  bz[idx] = az;
-    sx += ax;      sy += ay;      sz += az;
-    // advance
-    idx = (idx + 1) % N;
-    if (count < N) count++;
-}
-
-void imu_lpf_get(float* fax, float* fay, float* faz) {
-    float denom = (count > 0) ? (float)count : 1.0f;
-    if (fax) *fax = sx / denom;
-    if (fay) *fay = sy / denom;
-    if (faz) *faz = sz / denom;
-}
-
-// Simple tilt from accel (no gyro): roll/pitch only
-void imu_tilt_from_accel(float ax, float ay, float az,
-                         float* roll_deg, float* pitch_deg) {
-    // Protect against divide-by-zero
-    float g = sqrtf(ax*ax + ay*ay + az*az) + 1e-6f;
-
-    // Conventional aerospace-ish:
-    // roll  = atan2(ay, az)
-    // pitch = atan2(-ax, sqrt(ay^2 + az^2))
-    float roll  = atan2f(ay, az);
-    float pitch = atan2f(-ax, sqrtf(ay*ay + az*az));
-
-    if (roll_deg)  *roll_deg  = roll  * (180.0f / (float)M_PI);
-    if (pitch_deg) *pitch_deg = pitch * (180.0f / (float)M_PI);
-}
-
-// --- utils ---
-static inline void i2c_write_reg(uint8_t addr, uint8_t reg, uint8_t val) {
-    uint8_t b[2] = {reg, val};
-    i2c_write_blocking(I2C_PORT, addr, b, 2, false);
-}
-
-static inline void i2c_read_regs(uint8_t addr, uint8_t reg, uint8_t* dst, size_t n) {
-    uint8_t r = reg;
-    i2c_write_blocking(I2C_PORT, addr, &r, 1, true);
-    i2c_read_blocking(I2C_PORT, addr, dst, n, false);
-}
-
-bool imu_init_i2c0_gp0_gp1(void) {
-    i2c_init(I2C_PORT, 400 * 1000);
-    gpio_set_function(PIN_SDA, GPIO_FUNC_I2C);
-    gpio_set_function(PIN_SCL, GPIO_FUNC_I2C);
-    gpio_pull_up(PIN_SDA);
-    gpio_pull_up(PIN_SCL);
-    return true;
-}
-
-bool lsm303dlhc_init(void) {
-    // Accel: 50Hz, XYZ enable; High-Res + BDU, ±2g
-    // These are more stable than 10Hz/0x00.
-    i2c_write_reg(LSM303_ACC_ADDR, CTRL_REG1_A, 0x47); // 0b0100_0111
-    i2c_write_reg(LSM303_ACC_ADDR, CTRL_REG4_A, 0x88); // 0b1000_1000 (BDU+HR)
-    sleep_ms(10);
-
-    // Mag: 15 Hz (default), gain = +/-1.3G (default), continuous conversion
-    i2c_write_reg(LSM303_MAG_ADDR, CRA_REG_M, 0x10); // 0b0001_0000 -> 15Hz
-    i2c_write_reg(LSM303_MAG_ADDR, CRB_REG_M, 0x20); // gain setting (default-ish)
-    i2c_write_reg(LSM303_MAG_ADDR, MR_REG_M,  0x00); // continuous-conversion
-    sleep_ms(10);
-
-    // WHO_AM_I check (accel)
-    uint8_t who=0;
-    i2c_read_regs(LSM303_ACC_ADDR, WHO_AM_I_A, &who, 1);
-    return (who == 0x33);
-}
-
-void imu_set_accel_ema_alpha(float alpha) {
-    if (alpha > 0.0f && alpha < 1.0f) a_alpha = alpha;
-}
-
-void imu_set_mag_bias(float bx, float by, float bz) {
-    m_bias_x = bx; m_bias_y = by; m_bias_z = bz;
-}
-
-static void read_accel_counts(int16_t* x12, int16_t* y12, int16_t* z12) {
-    uint8_t raw[6]={0};
-    i2c_read_regs(LSM303_ACC_ADDR, OUT_X_L_A | 0x80, raw, 6); // auto-inc
-    int16_t x16 = (int16_t)((raw[1]<<8)|raw[0]);
-    int16_t y16 = (int16_t)((raw[3]<<8)|raw[2]);
-    int16_t z16 = (int16_t)((raw[5]<<8)|raw[4]);
-    *x12 = (x16 >> 4);
-    *y12 = (y16 >> 4);
-    *z12 = (z16 >> 4);
-}
-
-static void read_mag_raw(int16_t* mx, int16_t* my, int16_t* mz) {
-    uint8_t raw[6]={0};
-    // Note: order is X_H,X_L,Z_H,Z_L,Y_H,Y_L on DLHC
-    i2c_read_regs(LSM303_MAG_ADDR, OUT_X_H_M, raw, 6);
-    int16_t x = (int16_t)((raw[0]<<8)|raw[1]);
-    int16_t z = (int16_t)((raw[2]<<8)|raw[3]);
-    int16_t y = (int16_t)((raw[4]<<8)|raw[5]);
-    *mx = x; *my = y; *mz = z;
-}
-
-void imu_calibrate_bias(void) {
-    // --- Stage 1: Accelerometer Calibration (Robot MUST be still) ---
-    printf("--- ACCEL CALIBRATION ---\n");
-    printf("Place robot on a LEVEL surface and DO NOT MOVE.\n");
-    printf("Starting in 3...\n"); sleep_ms(1000);
-    printf("Starting in 2...\n"); sleep_ms(1000);
-    printf("Starting in 1...\n"); sleep_ms(1000);
-    printf("Calibrating... DO NOT MOVE.\n");
-
-    const int N_ACCEL = 200;
-    double sax = 0, say = 0, saz = 0;
-
-    for (int i = 0; i < N_ACCEL; i++) {
-        int16_t x, y, z; 
-        read_accel_counts(&x, &y, &z);
-        sax += x; say += y; saz += z;
-        sleep_ms(10);
-    }
-    
-    // Calibrate X and Y (assuming it's level)
-    a_bias_x = (float)(sax / N_ACCEL);
-    a_bias_y = (float)(say / N_ACCEL);
-    // DO NOT calibrate Z for gravity.
-    a_bias_z = 0.0f;
-    a_init = false; // re-seed EMA
-    
-    printf("Accel cal done. X_bias=%.2f, Y_bias=%.2f\n\n", a_bias_x, a_bias_y);
-    sleep_ms(1000);
-
-    // --- Stage 2: Magnetometer Calibration (Robot MUST rotate) ---
-    printf("--- MAG CALIBRATION ---\n");
-    printf("Pick up the robot. You will slowly rotate it 360 degrees\n");
-    printf("on all axes (spin it, flip it end-over-end, etc.)\n");
-    printf("Press ENTER key to start collecting data for 15 seconds...\n");
-    
-    // Wait for user to press Enter in the serial monitor
-    while (getchar_timeout_us(1000) == PICO_ERROR_TIMEOUT);
-
-    printf("GO! Calibrating... Rotate robot slowly on all axes...\n");
-    
-    m_min_x = 32767; m_max_x = -32768;
-    m_min_y = 32767; m_max_y = -32768;
-    m_min_z = 32767; m_max_z = -32768;
-
-    uint32_t start_time = time_us_32();
-    uint32_t cal_duration_ms = 15000; // 15 seconds
-
-    while ( (time_us_32() - start_time) < (cal_duration_ms * 1000) ) {
-        int16_t mx, my, mz;
-        read_mag_raw(&mx, &my, &mz);
-
-        if (mx < m_min_x) m_min_x = mx;
-        if (mx > m_max_x) m_max_x = mx;
-        if (my < m_min_y) m_min_y = my;
-        if (my > m_max_y) m_max_y = my;
-        if (mz < m_min_z) m_min_z = mz;
-        if (mz > m_max_z) m_max_z = mz;
-        
-        // Print progress
-        if ( (time_us_32() - start_time) % 1000000 < 20000) { // every second
-             printf("... %lus left ...\n", (cal_duration_ms*1000 - (time_us_32() - start_time))/1000000);
-        }
-        
-        sleep_ms(20); // sample at 50Hz
-    }
-
-    printf("...DONE collecting data.\n");
-
-    // Calculate hard-iron offsets (the center of the data cloud)
-    float bias_x = (float)(m_max_x + m_min_x) / 2.0f;
-    float bias_y = (float)(m_max_y + m_min_y) / 2.0f;
-    float bias_z = (float)(m_max_z + m_min_z) / 2.0f;
-
-    // Set the biases that imu_update() will use
-    imu_set_mag_bias(bias_x, bias_y, bias_z);
-    
-    printf("Magnetometer Calibration COMPLETE.\n");
-    printf("  X_bias: %.2f (min: %d, max: %d)\n", bias_x, m_min_x, m_max_x);
-    printf("  Y_bias: %.2f (min: %d, max: %d)\n", bias_y, m_min_y, m_max_y);
-    printf("  Z_bias: %.2f (min: %d, max: %d)\n", bias_z, m_min_z, m_max_z);
-    printf("--------------------------------------------\n\n");
+// --- Main Program ---
+int imu_main() {
+    stdio_init_all();
     sleep_ms(2000);
+    printf("Robotic Car Project - GY-511 IMU Test\n");
+    printf("Pitch, Roll, and Tilt-Compensated Yaw\n");
+    printf("--------------------------------------------------\n");
+
+    // --- I2C Initialization ---
+    i2c_init(I2C_PORT, 100 * 1000);
+    gpio_set_function(I2C_SDA_PIN, GPIO_FUNC_I2C);
+    gpio_set_function(I2C_SCL_PIN, GPIO_FUNC_I2C);
+    gpio_pull_up(I2C_SDA_PIN);
+    gpio_pull_up(I2C_SCL_PIN);
+    printf("I2C Initialized on GP%d (SDA) and GP%d (SCL)\n", I2C_SDA_PIN, I2C_SCL_PIN);
+
+    // --- Sensor Initialization ---
+    imu_init();
+    printf("LSM303DLHC Initialized.\n\n");
+
+    // --- Main Loop ---
+    while (true) {
+        int16_t raw_accel_data[3];
+        int16_t raw_mag_data[3];
+        
+        float pitch_deg, roll_deg, yaw_deg;
+
+        // 1. Read raw data
+        read_accel(raw_accel_data);
+        read_mag(raw_mag_data);
+
+        // 2. Apply filter
+        apply_ema_filter(raw_accel_data, filtered_accel);
+        apply_ema_filter(raw_mag_data, filtered_mag);
+
+        // 3. Calculate angles
+        calculate_angles(filtered_accel, filtered_mag, &pitch_deg, &roll_deg, &yaw_deg);
+
+        // 4. Print all data in a clean block
+        printf("--------------------------------------------------\n");
+
+        printf("Raw Accel:     X: %-6d  Y: %-6d  Z: %-6d\n", 
+               raw_accel_data[0], raw_accel_data[1], raw_accel_data[2]);
+        printf("Filtered Accel:  X: %-6.0f  Y: %-6.0f  Z: %-6.0f\n\n", 
+               filtered_accel[0], filtered_accel[1], filtered_accel[2]);
+        
+        printf("Raw Mag:       X: %-6d  Y: %-6d  Z: %-6d\n", 
+               raw_mag_data[0], raw_mag_data[1], raw_mag_data[2]);
+        printf("Filtered Mag:    X: %-6.0f  Y: %-6.0f  Z: %-6.0f\n\n", 
+               filtered_mag[0], filtered_mag[1], filtered_mag[2]);
+
+        printf("ANGLES:          Pitch: %-6.2f°  Roll: %-6.2f°  Yaw: %-6.2f°\n", 
+               pitch_deg, roll_deg, yaw_deg);
+
+        sleep_ms(500); // Slower update rate for readability
+    }
+    return 0;
 }
 
-static void accel_filter_push(float x, float y, float z) {
-    // optional: median-3 prefilter could be added here
-    if (!a_init) {
-        ax_f=x; ay_f=y; az_f=z; a_init=true;
-    } else {
-        ax_f = a_alpha*x + (1.f - a_alpha)*ax_f;
-        ay_f = a_alpha*y + (1.f - a_alpha)*ay_f;
-        az_f = a_alpha*z + (1.f - a_alpha)*az_f;
+// --- Function Definitions ---
+
+/**
+ * @brief Initializes the Accelerometer and Magnetometer
+ */
+void imu_init() {
+    // I2C Init
+    i2c_init(I2C_PORT, 100 * 1000); // 100kHz
+    gpio_set_function(I2C_SDA_PIN, GPIO_FUNC_I2C);
+    gpio_set_function(I2C_SCL_PIN, GPIO_FUNC_I2C);
+    gpio_pull_up(I2C_SDA_PIN);
+    gpio_pull_up(I2C_SCL_PIN);
+
+    // Sensor Init
+    uint8_t buf[2];
+    // Init Accelerometer (25 Hz, all axes)
+    buf[0] = 0x20;
+    buf[1] = 0x27;
+    i2c_write_blocking(I2C_PORT, ACCEL_ADDR, buf, 2, false);
+    // Init Magnetometer (Continuous conversion)
+    buf[0] = 0x02;
+    buf[1] = 0x00;
+    i2c_write_blocking(I2C_PORT, MAG_ADDR, buf, 2, false);
+}
+/**
+ * @brief Reads 6 bytes (X, Y, Z) from the Accelerometer
+ */
+void read_accel(int16_t accel[3]) {
+    uint8_t data[6];
+    uint8_t reg = 0xA8; // OUT_X_L_A (28h) with auto-increment
+    i2c_write_blocking(I2C_PORT, ACCEL_ADDR, &reg, 1, true); 
+    i2c_read_blocking(I2C_PORT, ACCEL_ADDR, data, 6, false);
+    accel[0] = (int16_t)((data[1] << 8) | data[0]);
+    accel[1] = (int16_t)((data[3] << 8) | data[2]);
+    accel[2] = (int16_t)((data[5] << 8) | data[4]);
+}
+
+/**
+ * @brief Reads 6 bytes (X, Y, Z) from the Magnetometer
+ */
+void read_mag(int16_t mag[3]) {
+    uint8_t data[6];
+    uint8_t reg = 0x03; // OUT_X_H_M (03h)
+    i2c_write_blocking(I2C_PORT, MAG_ADDR, &reg, 1, true);
+    i2c_read_blocking(I2C_PORT, MAG_ADDR, data, 6, false);
+    mag[0] = (int16_t)((data[0] << 8) | data[1]); // X
+    mag[1] = (int16_t)((data[4] << 8) | data[5]); // Y
+    mag[2] = (int16_t)((data[2] << 8) | data[3]); // Z
+}
+
+/**
+ * @brief Applies an Exponential Moving Average (EMA) low-pass filter
+ */
+void apply_ema_filter(int16_t raw_data[3], float filtered_data[3]) {
+    for (int i = 0; i < 3; i++) {
+        filtered_data[i] = (ALPHA * (float)raw_data[i]) + ((1.0 - ALPHA) * filtered_data[i]);
     }
 }
 
-static void tilt_from_accel_norm(float ax, float ay, float az, float* roll_deg, float* pitch_deg) {
-    // normalize
-    float g = sqrtf(ax*ax + ay*ay + az*az) + 1e-6f;
-    float nx = ax/g, ny = ay/g, nz = az/g;
-    float roll  = atan2f(ny, nz);
-    float pitch = atan2f(-nx, sqrtf(ny*ny + nz*nz));
-    *roll_deg  = roll  * 57.29578f;
-    *pitch_deg = pitch * 57.29578f;
+/**
+ * @brief NEW: Calculates pitch, roll, and yaw from filtered sensor data.
+ * * @param accel Filtered accelerometer data [X, Y, Z]
+ * @param mag   Filtered magnetometer data [X, Y, Z]
+ * @param pitch_out Pointer to store the calculated pitch in degrees
+ * @param roll_out  Pointer to store the calculated roll in degrees
+ * @param yaw_out   Pointer to store the calculated yaw in degrees
+ */
+void calculate_angles(float accel[3], float mag[3], float *pitch_out, float *roll_out, float *yaw_out) {
+    
+    // Get local copies of filtered data
+    float ax = accel[0];
+    float ay = accel[1];
+    float az = accel[2];
+    float mx = mag[0];
+    float my = mag[1];
+    float mz = mag[2];
+
+    // --- 1. Calculate Pitch and Roll from Accelerometer ---
+    float roll_rad = atan2(ay, az);
+    float pitch_rad = atan2(-ax, sqrt(ay * ay + az * az));
+
+    // --- 2. Calculate Tilt-Compensated Yaw (Heading) ---
+    float mag_y_comp = my * cos(roll_rad) - mz * sin(roll_rad);
+    float mag_x_comp = mx * cos(pitch_rad) + my * sin(roll_rad) * sin(pitch_rad) + mz * cos(roll_rad) * sin(pitch_rad);
+
+    // --- 3. Calculate Yaw in Radians ---
+    float yaw_rad = atan2(mag_y_comp, mag_x_comp);
+
+    // --- 4. Convert all angles from Radians to Degrees ---
+    *pitch_out = pitch_rad * (180.0 / M_PI);
+    *roll_out = roll_rad * (180.0 / M_PI);
+    *yaw_out = yaw_rad * (180.0 / M_PI);
+
+    // --- 5. (Improvement) Normalize Yaw to 0-360 degrees ---
+    if (*yaw_out < 0) {
+        *yaw_out += 360.0;
+    }
 }
+/**
+ * @brief Helper function to get the current filtered heading
+ * @return float Current yaw/heading (0-360 degrees)
+ */
+float get_filtered_heading(float filtered_accel[3], float filtered_mag[3]) {
+    int16_t raw_accel[3], raw_mag[3];
+    float pitch, roll, yaw;
 
-static float heading_tilt_comp(float mx_raw, float my_raw, float mz_raw,
-                               float roll_deg, float pitch_deg) {
-    // Quick tilt compensation using roll/pitch (in radians)
-    float cr = cosf(roll_deg  * 0.0174533f);
-    float sr = sinf(roll_deg  * 0.0174533f);
-    float cp = cosf(pitch_deg * 0.0174533f);
-    float sp = sinf(pitch_deg * 0.0174533f);
+    // 1. Read
+    read_accel(raw_accel);
+    read_mag(raw_mag);
 
-    // rotate mag vector by inverse tilt (accel frame -> horizontal plane)
-    // formulas adapted for LSM303 axis conventions
-    float mxh = mx_raw*cp + mz_raw*sp;
-    float myh = mx_raw*sr*sp + my_raw*cr - mz_raw*sr*cp;
+    // 2. Filter
+    apply_ema_filter(raw_accel, filtered_accel);
+    apply_ema_filter(raw_mag, filtered_mag);
 
-    float heading = atan2f(myh, mxh) * 57.29578f;
-    if (heading < 0) heading += 360.0f;
-    return heading;
-}
+    // 3. Calculate
+    calculate_angles(filtered_accel, filtered_mag, &pitch, &roll, &yaw);
 
-void imu_update(imu_pose_t* out) {
-    int16_t ax_c, ay_c, az_c;
-    int16_t mx_c, my_c, mz_c;
-
-    read_accel_counts(&ax_c, &ay_c, &az_c);
-    read_mag_raw(&mx_c, &my_c, &mz_c);
-
-    // subtract biases
-    float ax = (float)ax_c - a_bias_x;
-    float ay = (float)ay_c - a_bias_y;
-    float az = (float)az_c - a_bias_z;
-
-    float mx = (float)mx_c - m_bias_x;
-    float my = (float)my_c - m_bias_y;
-    float mz = (float)mz_c - m_bias_z;
-
-    // filter accel
-    accel_filter_push(ax, ay, az);
-
-    // roll/pitch from filtered accel
-    float roll_deg, pitch_deg;
-    tilt_from_accel_norm(ax_f, ay_f, az_f, &roll_deg, &pitch_deg);
-
-    // tilt-compensated heading using mag
-    float yaw_deg = heading_tilt_comp(mx, my, mz, roll_deg, pitch_deg);
-
-    latest.ax=ax_f; latest.ay=ay_f; latest.az=az_f;
-    latest.mx=mx;   latest.my=my;   latest.mz=mz;
-    latest.roll_deg=roll_deg; latest.pitch_deg=pitch_deg; latest.yaw_deg=yaw_deg;
-
-    if (out) *out = latest;
-}
-
-void imu_get_latest(imu_pose_t* out) {
-    if (out) *out = latest;
+    return yaw;
 }
