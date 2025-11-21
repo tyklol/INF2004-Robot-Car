@@ -136,7 +136,7 @@ static void publish_temperature_internal(MQTT_CLIENT_DATA_T *state) {
         if (len >= (int)sizeof(payload)) len = sizeof(payload) - 1;
         payload[len] = '\0';
         mqtt_publish(state->mqtt_client_inst, temperature_key, payload, strlen(payload), MQTT_PUBLISH_QOS, MQTT_PUBLISH_RETAIN, pub_request_cb, state);
-        printf("Publishing %s to %s\n", payload, temperature_key);
+        // printf("Publishing %s to %s\n", payload, temperature_key);
     }
 }
 
@@ -425,12 +425,11 @@ void mqtt_client_publish_temperature(MQTT_CLIENT_DATA_T *client_data) {
 }
 
 void mqtt_pub_imu_raw(MQTT_CLIENT_DATA_T *client_data, float ax, float ay, float az,
-                      float gx, float gy, float gz,
                       float mx, float my, float mz) {
     char buf[192];
     int n = snprintf(buf, sizeof(buf),
-        "{\"ax\":%.3f,\"ay\":%.3f,\"az\":%.3f}",
-        ax, ay, az);
+        "{\"accel_x\":%.3f,\"accel_y\":%.3f,\"accel_z\":%.3f, \"mag_x\":%.3f,\"mag_y\":%.3f,\"mag_z\":%.3f}",
+        ax, ay, az, mx, my, mz);
     if (n <= 0 || n >= (int)sizeof(buf)) {
         printf("mqtt_pub_imu_raw: snprintf error or buffer too small\n");
     } else {
@@ -442,7 +441,7 @@ void mqtt_pub_imu_filtered(MQTT_CLIENT_DATA_T *client_data, float fax, float fay
                            float roll, float pitch, float yaw) {
     char buf[192];
     int n = snprintf(buf, sizeof(buf),
-        "{\"fax\":%.3f,\"fay\":%.3f,\"faz\":%.3f,"
+        "{\"faccel_x\":%.3f,\"faccel_y\":%.3f,\"faccel_z\":%.3f,"
         "\"roll\":%.2f,\"pitch\":%.2f,\"yaw\":%.2f}",
         fax, fay, faz, roll, pitch, yaw);
     if (n <= 0 || n >= (int)sizeof(buf)) {
@@ -479,11 +478,49 @@ void mqtt_pub_obstacle(MQTT_CLIENT_DATA_T *client_data, float distance_cm, float
         mqtt_client_publish(client_data, "robot/obstacle", buf);
     }
 }
+
+void mqtt_pub_telemetry(MQTT_CLIENT_DATA_T *client_data, int g_current_scenario,
+                       const char *g_current_ir_state,
+                       float g_target_power_left,
+                       float g_target_power_right,
+                       int32_t g_total_ticks_left,
+                       int32_t g_total_ticks_right,
+                       uint16_t g_sensor_R,
+                       uint32_t g_current_lost_time_ms, int g_current_state) {
+    char buf[256];
+    int n = snprintf(buf, sizeof(buf), "{\"SCEN\": %d, \"IR_State\": %s, \"Pwr_L\": %.1f, \"Pwr_R\": %.1f, \"Ticks_L\": %d, \"Ticks_R\": %d, \"Sensor_R\": %u, \"Lost_ms\": %u, \"State\": %s}",
+                       g_current_scenario,
+                       g_current_ir_state,
+                       g_target_power_left,
+                       g_target_power_right,
+                       g_total_ticks_left,
+                       g_total_ticks_right,
+                       g_sensor_R,
+                       g_current_lost_time_ms, g_current_state ? "Tracking Left" : "Tracking Right");
+    if (n <= 0 || n >= (int)sizeof(buf)) {
+        printf("mqtt_pub_telemetry: snprintf error or buffer too small\n");
+    } else {
+        mqtt_client_publish(client_data, "robot/telemetry", buf);
+    }
+}
 /* Thin wrappers for publish/subscribe/disconnect */
 
 void mqtt_client_publish(MQTT_CLIENT_DATA_T *client_data, const char *topic, const char *data) {
     if (!client_data || !client_data->mqtt_client_inst) return;
-    mqtt_publish(client_data->mqtt_client_inst, topic, data, strlen(data), MQTT_PUBLISH_QOS, MQTT_PUBLISH_RETAIN, pub_request_cb, client_data);
+
+    // --- FIX: LOCK THE NETWORK STACK ---
+    cyw43_arch_lwip_begin(); 
+    
+    err_t err = mqtt_publish(client_data->mqtt_client_inst, topic, data, strlen(data), 
+                             MQTT_PUBLISH_QOS, MQTT_PUBLISH_RETAIN, pub_request_cb, client_data);
+     
+    cyw43_arch_lwip_end();
+    // --- END FIX ---
+
+    if (err != ERR_OK) {
+        printf("mqtt_publish failed: %d\n", err);
+    }
+    // mqtt_publish(client_data->mqtt_client_inst, topic, data, strlen(data), MQTT_PUBLISH_QOS, MQTT_PUBLISH_RETAIN, pub_request_cb, client_data);
 }
 
 void mqtt_client_subscribe(MQTT_CLIENT_DATA_T *client_data, const char *topic) {

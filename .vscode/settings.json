@@ -16,6 +16,7 @@
         "timer.h": "c",
         "obstacle_detector.h": "c",
         "stdlib.h": "c",
-        "pwm.h": "c"
+        "pwm.h": "c",
+        "stdint.h": "c"
     }
 }

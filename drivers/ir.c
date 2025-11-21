@@ -4,72 +4,7 @@
 #include <math.h>
 #include <stdio.h>
 
-// ===== ROBOT CONFIG =====
-#define SENSOR_ON_RIGHT  1
-#define ALLOW_REVERSE    0
-
-// ---- Pin map ----
-#define PIN_IR_RIGHT_ADC_GPIO 26
-#define PIN_IR_RIGHT_ADC_CH   0
-#define ADC_SAMPLES           12
-
-// ---- Calibration (set at runtime) ----
-static float SENSOR_WHITE = 180.0f;
-static float SENSOR_BLACK = 2400.0f;
-// --- State Machine ---
-typedef enum {
-    TRACK_RIGHT_EDGE,
-    TRACK_LEFT_EDGE
-} ir_state_t;
-// ---- Line-Following PD Controller ----
-#define PID_SETPOINT     0.5f
-
-// --- MODIFIED: Tuning parameters struct ---
-typedef struct {
-    float kp;
-    float ki;
-    float kd;
-    float steer_clamp;
-    float base_scale;
-    float curve_slowdown;
-    float curve_exp;
-    float min_speed_frac;
-    uint32_t timeout_R_to_L_ms; // --- NEW ---
-    uint32_t timeout_L_to_R_ms; // --- NEW ---
-} ir_tuning_params_t;
-
-// Default to your tune (timeouts are placeholders)
-static ir_tuning_params_t g_params = {
-    .kp = 15.0f,
-    .ki = 0.0f,
-    .kd = 0.0f,
-    .steer_clamp = 20.0f,
-    .base_scale = 1.0f,
-    .curve_slowdown = 0.5f,
-    .curve_exp = 1.2f,
-    .min_speed_frac = 0.4f,
-    .timeout_R_to_L_ms = 320, // --- NEW ---
-    .timeout_L_to_R_ms = 635  // --- NEW ---
-};
-
-
-// ===== Internals =====
-static float pid_integral = 0.0f;
-static float pid_last_error = 0.0f;
-static absolute_time_t pid_last_time;
-
-// --- State Machine ---
-// (typedef moved to ir.h)
-
-static ir_state_t g_current_state = TRACK_RIGHT_EDGE; // Start state
-static uint32_t g_time_lost_ms = 0;
-
-// --- State Names for Telemetry ---
-static const char* STATE_NAME_TRACK_R = "S_TRACK_R";
-static const char* STATE_NAME_TRACK_L = "S_TRACK_L";
-static const char* STATE_NAME_LOST_W_R = "S_LOST_W_R";
-static const char* STATE_NAME_LOST_W_L = "S_LOST_W_L";
-static const char* STATE_NAME_LOST_B = "S_LOST_B";
+ir_state_t g_current_state = TRACK_RIGHT_EDGE;
 
 // --- Helper Functions ---
 static inline float clampf(float x, float lo, float hi) {
@@ -81,6 +16,65 @@ static uint16_t adc_read_avg(uint ch, int samples) {
     uint32_t acc = 0;
     for (int i = 0; i < samples; i++) acc += adc_read();
     return (uint16_t)(acc / samples);
+}
+
+static float ir_compute_steer(float R_norm, int g_current_state, float dt_s, float yaw_rate_dps) {
+    // 4) Calculate error based on mode
+    float error;
+    if (g_current_state == TRACK_RIGHT_EDGE) {
+        error = R_norm - PID_SETPOINT;
+    } else { // TRACK_LEFT_EDGE
+        error = PID_SETPOINT - R_norm;
+    }
+
+    // 5) Calculate PD terms
+    // (unchanged)
+    float p_term = g_params.kp * error;
+    if (g_params.ki != 0.0f) {
+        pid_integral += error * dt_s;
+        pid_integral = clampf(pid_integral, -10.0f, 10.0f);
+    } else {
+        pid_integral = 0.0f;
+    }
+    float i_term = g_params.ki * pid_integral;
+    float derivative = (error - pid_last_error) / dt_s;
+    pid_last_error = error;
+    float d_term = g_params.kd * derivative;
+
+// 6) AGGRESSIVE CURVE-EXIT CORRECTION with IMU damping
+float rotation_damping = 0.0f;
+const float IMU_DAMPING_GAIN = 0.30f;  // Increased for stronger damping mid-curve
+const float YAW_RATE_THRESHOLD = 30.0f;
+const float CURVE_EXIT_THRESHOLD = 0.08f;  // LOWERED - exit curve sooner
+
+// Detect if we're exiting a curve (error approaching zero)
+bool near_straight_line = (fabsf(error) < CURVE_EXIT_THRESHOLD);
+
+if (fabsf(yaw_rate_dps) > YAW_RATE_THRESHOLD) {
+    if (near_straight_line) {
+        // CURVE EXIT: Apply COUNTER-rotation boost to force straightening
+        // If still rotating but error is small, we need to fight the rotation
+        float exit_boost_gain = 0.40f;  // Strong correction
+        rotation_damping = -exit_boost_gain * yaw_rate_dps;
+    } else {
+        // MID-CURVE: Apply normal damping, but with gradual rampdown
+        float excess_rotation = fabsf(yaw_rate_dps) - YAW_RATE_THRESHOLD;
+        
+        // Gradually reduce damping as we approach straight line
+        float damping_scale = clampf((fabsf(error) - CURVE_EXIT_THRESHOLD) / 0.25f, 0.0f, 1.0f);
+        
+        rotation_damping = -IMU_DAMPING_GAIN * excess_rotation * damping_scale * (yaw_rate_dps > 0 ? 1.0f : -1.0f);
+    }
+}
+
+// 7) Calculate final steering with IMU correction
+float steer = p_term + i_term + d_term + rotation_damping;
+steer = clampf(steer, -g_params.steer_clamp, +g_params.steer_clamp);
+
+
+
+
+    return steer;
 }
 
 // ===== Public API =====
@@ -169,8 +163,8 @@ void ir_follow_line_single(float base_speed_tps,
                            float *out_target_left_tps, float *out_target_right_tps,
                            uint16_t *out_R_adc,
                            const char **out_state_name,
-                           uint32_t *out_time_lost_ms // --- NEW ---
-                          ) {
+                           uint32_t *out_time_lost_ms,
+                          float yaw_rate_dps) {
     
     // 1) Read & normalize sensor
     // (unchanged)
@@ -213,33 +207,7 @@ void ir_follow_line_single(float base_speed_tps,
         g_time_lost_ms = 0;
     }
 
-    // 4) Calculate error based on state
-    // (unchanged)
-    float error;
-    if (g_current_state == TRACK_RIGHT_EDGE) {
-        error = R_norm - PID_SETPOINT;
-    } else { // TRACK_LEFT_EDGE
-        error = PID_SETPOINT - R_norm;
-    }
-
-    // 5) Calculate PD terms
-    // (unchanged)
-    float p_term = g_params.kp * error;
-    if (g_params.ki != 0.0f) {
-        pid_integral += error * dt_s;
-        pid_integral = clampf(pid_integral, -10.0f, 10.0f);
-    } else {
-        pid_integral = 0.0f;
-    }
-    float i_term = g_params.ki * pid_integral;
-    float derivative = (error - pid_last_error) / dt_s;
-    pid_last_error = error;
-    float d_term = g_params.kd * derivative;
-
-    // 6) Calculate final steering command
-    // (unchanged)
-    float steer = p_term + i_term + d_term;
-    steer = clampf(steer, -g_params.steer_clamp, +g_params.steer_clamp);
+    float steer = ir_compute_steer(R_norm, g_current_state, dt_s, yaw_rate_dps);
 
     // 7) Dynamic Speed
     // (unchanged)

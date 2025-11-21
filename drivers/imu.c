@@ -10,7 +10,7 @@
  */
 
 // --- NEW: I2C/IMU Definitions ---
-#define I2C_PORT i2c0
+#define I2C_PORT i2c1
 #define I2C_SDA_PIN 2 // (Check your wiring - using GP2)
 #define I2C_SCL_PIN 3 // (Check your wiring - using GP3)
 #define ACCEL_ADDR 0x19
@@ -19,9 +19,12 @@
 // --- Filter Configuration ---
 const float ALPHA = 0.2; // Smoothing factor (smaller = more smoothing)
 
-// --- Global Variables for Filter State ---
+// --- Global Variables for Raw and Filtered Data ---
+int16_t raw_accel_data[3];
+int16_t raw_mag_data[3];
 float filtered_accel[3] = {0.0, 0.0, 0.0};
 float filtered_mag[3] = {0.0, 0.0, 0.0};
+float pitch_deg, roll_deg, yaw_deg;
 
 // --- Function Prototypes ---
 void imu_init();
@@ -29,7 +32,9 @@ void read_accel(int16_t accel[3]);
 void read_mag(int16_t mag[3]);
 void apply_ema_filter(int16_t raw_data[3], float filtered_data[3]);
 void calculate_angles(float accel[3], float mag[3], float *pitch_out, float *roll_out, float *yaw_out);
-float get_filtered_heading(float filtered_accel[3], float filtered_mag[3]);
+float get_filtered_heading(int16_t raw_accel[3], int16_t raw_mag[3], float filtered_accel[3], float filtered_mag[3], 
+    float *pitch_deg, float *roll_deg, float *yaw_deg);
+float imu_get_yaw_rate(void);
 
 // --- Main Program ---
 int imu_main() {
@@ -53,11 +58,6 @@ int imu_main() {
 
     // --- Main Loop ---
     while (true) {
-        int16_t raw_accel_data[3];
-        int16_t raw_mag_data[3];
-        
-        float pitch_deg, roll_deg, yaw_deg;
-
         // 1. Read raw data
         read_accel(raw_accel_data);
         read_mag(raw_mag_data);
@@ -192,10 +192,8 @@ void calculate_angles(float accel[3], float mag[3], float *pitch_out, float *rol
  * @brief Helper function to get the current filtered heading
  * @return float Current yaw/heading (0-360 degrees)
  */
-float get_filtered_heading(float filtered_accel[3], float filtered_mag[3]) {
-    int16_t raw_accel[3], raw_mag[3];
-    float pitch, roll, yaw;
-
+float get_filtered_heading(int16_t raw_accel[3], int16_t raw_mag[3], float filtered_accel[3], float filtered_mag[3], 
+    float *pitch_deg, float *roll_deg, float *yaw_deg) {
     // 1. Read
     read_accel(raw_accel);
     read_mag(raw_mag);
@@ -205,7 +203,45 @@ float get_filtered_heading(float filtered_accel[3], float filtered_mag[3]) {
     apply_ema_filter(raw_mag, filtered_mag);
 
     // 3. Calculate
-    calculate_angles(filtered_accel, filtered_mag, &pitch, &roll, &yaw);
+    calculate_angles(filtered_accel, filtered_mag, pitch_deg, roll_deg, yaw_deg);
 
-    return yaw;
+    return *yaw_deg;
+}
+/**
+ * @brief Get current yaw rate (angular velocity around Z-axis)
+ * @return float Yaw rate in degrees per second
+ */
+float imu_get_yaw_rate(void) {
+    // The gyroscope Z-axis gives rotation rate
+    // LSM303DLHC doesn't have gyro - it only has accel + mag
+    // If you're using LSM303DLHC, you need to calculate yaw rate from heading changes
+    
+    static float last_yaw = 0.0f;
+    static absolute_time_t last_time;
+    static bool first_call = true;
+    
+    if (first_call) {
+        last_yaw = yaw_deg;
+        last_time = get_absolute_time();
+        first_call = false;
+        return 0.0f;
+    }
+    
+    absolute_time_t now = get_absolute_time();
+    float dt_s = absolute_time_diff_us(last_time, now) / 1e6f;
+    if (dt_s <= 0.0f || dt_s > 0.1f) return 0.0f;
+    
+    // Calculate yaw rate from heading change
+    float yaw_diff = yaw_deg - last_yaw;
+    
+    // Handle wraparound (360° -> 0° transition)
+    if (yaw_diff > 180.0f) yaw_diff -= 360.0f;
+    if (yaw_diff < -180.0f) yaw_diff += 360.0f;
+    
+    float yaw_rate = yaw_diff / dt_s;  // degrees per second
+    
+    last_yaw = yaw_deg;
+    last_time = now;
+    
+    return yaw_rate;
 }

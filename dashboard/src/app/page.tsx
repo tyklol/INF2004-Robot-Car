@@ -59,7 +59,7 @@ function useMqtt(brokerUrl: string, topic: string) {
 }
 
 export default function Home() {
-  // const broker = "ws://10.114.145.205:8080";
+  // const broker = "ws://10.67.121.205:8080";
   const broker = "ws://localhost:8080";
   const topic = "#";
   const messages = useMqtt(broker, topic);

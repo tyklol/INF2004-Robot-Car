@@ -3,6 +3,7 @@
 
 #include "pico/stdlib.h"
 #include "lwip/apps/mqtt.h"
+#include "ir.h"
 
 #ifndef MQTT_TOPIC_LEN
 #define MQTT_TOPIC_LEN 100
@@ -56,8 +57,7 @@ void mqtt_client_poll(MQTT_CLIENT_DATA_T *client_data);
 /* Publish current temperature if connected. Safe to call from main loop. */
 void mqtt_client_publish_temperature(MQTT_CLIENT_DATA_T *client_data);
 
-void mqtt_pub_imu_raw(MQTT_CLIENT_DATA_T *client_data, float ax, float ay, float az, 
-    float gx, float gy, float gz, float mx, float my, float mz);
+void mqtt_pub_imu_raw(MQTT_CLIENT_DATA_T *client_data, float ax, float ay, float az, float mx, float my, float mz);
 
 void mqtt_pub_imu_filtered(MQTT_CLIENT_DATA_T *client_data, float fax, float fay, float faz,
                            float roll, float pitch, float yaw);
@@ -66,7 +66,16 @@ void mqtt_pub_speed(MQTT_CLIENT_DATA_T *client_data, int g_current_scenario, con
     float g_target_power_left, float g_target_power_right,
     float local_distance_cm, uint32_t g_current_lost_time_ms, int32_t g_total_ticks_left, int32_t g_total_ticks_right);
 
-    void mqtt_pub_obstacle(MQTT_CLIENT_DATA_T *client_data, float distance_cm, float width_cm);
+void mqtt_pub_obstacle(MQTT_CLIENT_DATA_T *client_data, float distance_cm, float width_cm);
+
+void mqtt_pub_telemetry(MQTT_CLIENT_DATA_T *client_data, int g_current_scenario,
+                       const char *g_current_ir_state,
+                       float g_target_power_left,
+                       float g_target_power_right,
+                       int32_t g_total_ticks_left,
+                       int32_t g_total_ticks_right,
+                       uint16_t g_sensor_R,
+                       uint32_t g_current_lost_time_ms, int g_current_state);
 /* Publish arbitrary topic/data (wrapper). */
 void mqtt_client_publish(MQTT_CLIENT_DATA_T *client_data, const char *topic, const char *data);
 
