@@ -75,7 +75,7 @@ void mqtt_pub_telemetry(MQTT_CLIENT_DATA_T *client_data, int g_current_scenario,
                        int32_t g_total_ticks_left,
                        int32_t g_total_ticks_right,
                        uint16_t g_sensor_R,
-                       uint32_t g_current_lost_time_ms, int g_current_state);
+                       uint32_t g_current_lost_time_ms, int turn_direction);
 /* Publish arbitrary topic/data (wrapper). */
 void mqtt_client_publish(MQTT_CLIENT_DATA_T *client_data, const char *topic, const char *data);
 
@@ -87,5 +87,8 @@ void mqtt_client_disconnect(MQTT_CLIENT_DATA_T *client_data);
 
 /* Returns true if MQTT is connected and ready. */
 bool mqtt_client_is_online(MQTT_CLIENT_DATA_T *client_data);
+
+extern char g_last_barcode_cmd[32];
+extern volatile bool g_barcode_received;
 
 #endif // MQTT_CLIENT_H

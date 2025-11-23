@@ -76,6 +76,9 @@
 #define MQTT_UNIQUE_TOPIC 0
 #endif
 
+char g_last_barcode_cmd[32] = {0};
+volatile bool g_barcode_received = false;   
+
 /* Internal helpers (kept static) */
 static float read_onboard_temperature(const char unit) {
     adc_select_input(4);
@@ -169,6 +172,7 @@ static void unsub_request_cb(void *arg, err_t err) {
 static void sub_unsub_topics(MQTT_CLIENT_DATA_T* state, bool sub) {
     mqtt_request_cb_t cb = sub ? sub_request_cb : unsub_request_cb;
     mqtt_sub_unsub(state->mqtt_client_inst, full_topic(state, "/led"), MQTT_SUBSCRIBE_QOS, cb, state, sub);
+    mqtt_sub_unsub(state->mqtt_client_inst, full_topic(state, "/barcode"), MQTT_SUBSCRIBE_QOS, cb, state, sub);
     mqtt_sub_unsub(state->mqtt_client_inst, full_topic(state, "/print"), MQTT_SUBSCRIBE_QOS, cb, state, sub);
     mqtt_sub_unsub(state->mqtt_client_inst, full_topic(state, "/ping"), MQTT_SUBSCRIBE_QOS, cb, state, sub);
     mqtt_sub_unsub(state->mqtt_client_inst, full_topic(state, "/exit"), MQTT_SUBSCRIBE_QOS, cb, state, sub);
@@ -192,6 +196,13 @@ static void mqtt_incoming_data_cb(void *arg, const u8_t *data, u16_t len, u8_t f
             control_led(state, true);
         else if (lwip_stricmp((const char *)state->data, "Off") == 0 || strcmp((const char *)state->data, "0") == 0)
             control_led(state, false);
+    } else if (strcmp(basic_topic, "/barcode") == 0) {
+        uint16_t copy_len = (len > 31) ? 31 : len;
+        memcpy(g_last_barcode_cmd, data, copy_len);
+        g_last_barcode_cmd[copy_len] = '\0'; // Null terminate
+        
+        // 2. Set the flag so main.c knows new data is here
+        g_barcode_received = true;
     } else if (strcmp(basic_topic, "/print") == 0) {
         printf("%.*s\n", len, data);
     } else if (strcmp(basic_topic, "/ping") == 0) {
@@ -486,7 +497,7 @@ void mqtt_pub_telemetry(MQTT_CLIENT_DATA_T *client_data, int g_current_scenario,
                        int32_t g_total_ticks_left,
                        int32_t g_total_ticks_right,
                        uint16_t g_sensor_R,
-                       uint32_t g_current_lost_time_ms, int g_current_state) {
+                       uint32_t g_current_lost_time_ms, int turn_direction) {
     char buf[256];
     int n = snprintf(buf, sizeof(buf), "{\"SCEN\": %d, \"IR_State\": %s, \"Pwr_L\": %.1f, \"Pwr_R\": %.1f, \"Ticks_L\": %d, \"Ticks_R\": %d, \"Sensor_R\": %u, \"Lost_ms\": %u, \"State\": %s}",
                        g_current_scenario,
@@ -496,7 +507,8 @@ void mqtt_pub_telemetry(MQTT_CLIENT_DATA_T *client_data, int g_current_scenario,
                        g_total_ticks_left,
                        g_total_ticks_right,
                        g_sensor_R,
-                       g_current_lost_time_ms, g_current_state ? "Tracking Left" : "Tracking Right");
+                       g_current_lost_time_ms, 
+                       turn_direction == -1? "Turning Left" : turn_direction == 1 ? "Turning Right" : "Not Turning");
     if (n <= 0 || n >= (int)sizeof(buf)) {
         printf("mqtt_pub_telemetry: snprintf error or buffer too small\n");
     } else {
