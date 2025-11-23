@@ -4,8 +4,6 @@
 #include <math.h>
 #include <stdio.h>
 
-ir_state_t g_current_state = TRACK_RIGHT_EDGE;
-
 // --- Helper Functions ---
 static inline float clampf(float x, float lo, float hi) {
     return x < lo ? lo : (x > hi ? hi : x);
@@ -18,92 +16,20 @@ static uint16_t adc_read_avg(uint ch, int samples) {
     return (uint16_t)(acc / samples);
 }
 
-static float ir_compute_steer(float R_norm, int g_current_state, float dt_s, float yaw_rate_dps) {
-    // 4) Calculate error based on mode
-    float error;
-    if (g_current_state == TRACK_RIGHT_EDGE) {
-        error = R_norm - PID_SETPOINT;
-    } else { // TRACK_LEFT_EDGE
-        error = PID_SETPOINT - R_norm;
-    }
-
-    // 5) Calculate PD terms
-    // (unchanged)
-    float p_term = g_params.kp * error;
-    if (g_params.ki != 0.0f) {
-        pid_integral += error * dt_s;
-        pid_integral = clampf(pid_integral, -10.0f, 10.0f);
-    } else {
-        pid_integral = 0.0f;
-    }
-    float i_term = g_params.ki * pid_integral;
-    float derivative = (error - pid_last_error) / dt_s;
-    pid_last_error = error;
-    float d_term = g_params.kd * derivative;
-
-// 6) AGGRESSIVE CURVE-EXIT CORRECTION with IMU damping
-float rotation_damping = 0.0f;
-const float IMU_DAMPING_GAIN = 0.30f;  // Increased for stronger damping mid-curve
-const float YAW_RATE_THRESHOLD = 30.0f;
-const float CURVE_EXIT_THRESHOLD = 0.08f;  // LOWERED - exit curve sooner
-
-// Detect if we're exiting a curve (error approaching zero)
-bool near_straight_line = (fabsf(error) < CURVE_EXIT_THRESHOLD);
-
-if (fabsf(yaw_rate_dps) > YAW_RATE_THRESHOLD) {
-    if (near_straight_line) {
-        // CURVE EXIT: Apply COUNTER-rotation boost to force straightening
-        // If still rotating but error is small, we need to fight the rotation
-        float exit_boost_gain = 0.40f;  // Strong correction
-        rotation_damping = -exit_boost_gain * yaw_rate_dps;
-    } else {
-        // MID-CURVE: Apply normal damping, but with gradual rampdown
-        float excess_rotation = fabsf(yaw_rate_dps) - YAW_RATE_THRESHOLD;
-        
-        // Gradually reduce damping as we approach straight line
-        float damping_scale = clampf((fabsf(error) - CURVE_EXIT_THRESHOLD) / 0.25f, 0.0f, 1.0f);
-        
-        rotation_damping = -IMU_DAMPING_GAIN * excess_rotation * damping_scale * (yaw_rate_dps > 0 ? 1.0f : -1.0f);
-    }
-}
-
-// 7) Calculate final steering with IMU correction
-float steer = p_term + i_term + d_term + rotation_damping;
-steer = clampf(steer, -g_params.steer_clamp, +g_params.steer_clamp);
-
-
-
-
-    return steer;
-}
-
 // ===== Public API =====
 
-/**
- * @brief MODIFIED: Public function to update the static tuning params.
- */
 void ir_set_tuning_params(float kp, float ki, float kd, 
-                          float steer_clamp, float base_scale, 
-                          float curve_slowdown, float curve_exp, 
-                          float min_speed_frac,
-                          uint32_t timeout_R_to_L, // --- NEW ---
-                          uint32_t timeout_L_to_R  // --- NEW ---
-                         ) 
+                          float steer_clamp, float base_scale) 
 {
     g_params.kp = kp;
     g_params.ki = ki;
     g_params.kd = kd;
     g_params.steer_clamp = steer_clamp;
     g_params.base_scale = base_scale;
-    g_params.curve_slowdown = curve_slowdown;
-    g_params.curve_exp = curve_exp;
-    g_params.min_speed_frac = min_speed_frac;
-    g_params.timeout_R_to_L_ms = timeout_R_to_L; // --- NEW ---
-    g_params.timeout_L_to_R_ms = timeout_L_to_R; // --- NEW ---
 }
 
 void ir_init(void) {
-    ir_reset_robot_state();
+    ir_reset_pid_state();
 }
 
 void ir_reset_pid_state(void) {
@@ -112,142 +38,90 @@ void ir_reset_pid_state(void) {
     pid_last_time = get_absolute_time();
 }
 
-/**
- * @brief Resets the full robot state machine to default
- */
-void ir_reset_robot_state(void) {
-    ir_reset_pid_state();
-    g_current_state = TRACK_RIGHT_EDGE; // Default to right edge
-    g_time_lost_ms = 0;
-}
-
-/**
- * @brief NEW: Forces the state machine into a specific state
- */
-void ir_force_state(int state) {
-    if (state == IR_STATE_TRACK_LEFT) {
-        g_current_state = TRACK_LEFT_EDGE;
-    } else {
-        g_current_state = TRACK_RIGHT_EDGE;
-    }
-    g_time_lost_ms = 0;
-    ir_reset_pid_state(); // Reset PID on a forced switch
-}
-
-
 void ir_set_calibration_values(uint16_t white, uint16_t black) {
-    // (unchanged)
     SENSOR_WHITE = (float)white;
     SENSOR_BLACK = (float)black;
-    if (SENSOR_BLACK < SENSOR_WHITE) {
-        printf("WARNING: Black ADC < White ADC. Swapping values.\n");
-        float temp = SENSOR_BLACK;
-        SENSOR_BLACK = SENSOR_WHITE;
-        SENSOR_WHITE = temp;
-    }
+    // Safety check to prevent division by zero
     if (fabsf(SENSOR_BLACK - SENSOR_WHITE) < 100.0f) {
-        printf("WARNING: Small IR range. White=%d Black=%d\n", (int)SENSOR_WHITE, (int)SENSOR_BLACK);
         SENSOR_BLACK = SENSOR_WHITE + 500.0f;
     }
-    printf("IR Cal: White=%.0f Black=%.0f Range=%.0f\n",
-           SENSOR_WHITE, SENSOR_BLACK, SENSOR_BLACK - SENSOR_WHITE);
+    printf("IR Calibrated: White=%.0f Black=%.0f\n", SENSOR_WHITE, SENSOR_BLACK);
 }
 
 uint16_t ir_read_single_sensor_raw(void) {
-    // (unchanged)
     return adc_read_avg(PIN_IR_RIGHT_ADC_CH, ADC_SAMPLES);
 }
 
-// --- MODIFIED --- Function signature
+/**
+ * @brief Simplified Single Sensor Line Follower (Left Edge Strategy)
+ */
 void ir_follow_line_single(float base_speed_tps,
                            float *out_target_left_tps, float *out_target_right_tps,
-                           uint16_t *out_R_adc,
-                           const char **out_state_name,
-                           uint32_t *out_time_lost_ms,
-                          float yaw_rate_dps) {
+                           uint16_t *out_R_adc) {
     
-    // 1) Read & normalize sensor
-    // (unchanged)
+    // 1. Read & Normalize Sensor
     uint16_t R_adc = adc_read_avg(PIN_IR_RIGHT_ADC_CH, ADC_SAMPLES);
+    
+    // Normalize to 0.0 (White) to 1.0 (Black)
     float R_norm = (R_adc - SENSOR_WHITE) / (SENSOR_BLACK - SENSOR_WHITE);
     R_norm = clampf(R_norm, 0.0f, 1.0f);
 
-    // 2) Calculate delta-time (dt)
-    // (unchanged)
+    // 2. Calculate Delta Time
     absolute_time_t now = get_absolute_time();
     float dt_s = absolute_time_diff_us(pid_last_time, now) / 1e6f;
     if (dt_s <= 0.0f || dt_s > 0.1f) dt_s = 0.01f;
     pid_last_time = now;
-    uint32_t dt_ms = (uint32_t)(dt_s * 1000.0f);
 
-    // 3) --- MODIFIED: STATE MACHINE LOGIC ---
-    bool line_is_lost_white = (R_norm < 0.1f);
+    // 3. Calculate Error (LEFT EDGE STRATEGY)
+    // Target is 0.5.
+    // White (0.0) -> Error = +0.5 (Turn Right)
+    // Black (1.0) -> Error = -0.5 (Turn Left)
+    float error = PID_SETPOINT - R_norm;
 
-    if (line_is_lost_white) {
-        g_time_lost_ms += dt_ms;
-
-        // --- NEW: Select the correct timeout based on the *current* state ---
-        uint32_t current_timeout_threshold = 
-            (g_current_state == TRACK_RIGHT_EDGE) ? 
-            g_params.timeout_R_to_L_ms :  // Use R->L timeout
-            g_params.timeout_L_to_R_ms;   // Use L->R timeout
-
-        // Check for timeout
-        if (g_time_lost_ms > current_timeout_threshold) {
-            // --- TIMEOUT TRIGGER! ---
-            if (g_current_state == TRACK_RIGHT_EDGE) {
-                g_current_state = TRACK_LEFT_EDGE;
-            } else {
-                g_current_state = TRACK_RIGHT_EDGE;
-            }
-            g_time_lost_ms = 0;
-            ir_reset_pid_state(); 
-        }
-    } else {
-        g_time_lost_ms = 0;
+    // --- FIX: ASYMMETRIC GAIN ---
+    // If Error is NEGATIVE, we are seeing BLACK (Scenario B).
+    // We risk crossing the line. We must react HARDER here.
+    float current_kp = g_params.kp;
+    if (error < 0) {
+        current_kp = g_params.kp * 2.5f; // 2.5x stronger reaction to Black
     }
+    // ----------------------------
 
-    float steer = ir_compute_steer(R_norm, g_current_state, dt_s, yaw_rate_dps);
+    // 4. PID Calculation
+    float p_term = current_kp * error;
 
-    // 7) Dynamic Speed
-    // (unchanged)
-    float steer_frac = fabsf(steer) / g_params.steer_clamp; 
-    float curve_scale = 1.0f - (g_params.curve_slowdown * powf(steer_frac, g_params.curve_exp));
-    curve_scale = clampf(curve_scale, g_params.min_speed_frac, 1.0f);
-    float final_base_speed = base_speed_tps * g_params.base_scale * curve_scale;
+    pid_integral += error * dt_s;
+    pid_integral = clampf(pid_integral, -10.0f, 10.0f);
+    float i_term = g_params.ki * pid_integral;
 
-    // 8) Map steer to wheel targets
-    // (unchanged)
-    float left_tps  = final_base_speed + steer;
-    float right_tps = final_base_speed - steer;
+    float derivative = (error - pid_last_error) / dt_s;
+    pid_last_error = error;
+    float d_term = g_params.kd * derivative;
 
-    // 9) Apply "No Reverse" logic
-    // (unchanged)
-    #if !ALLOW_REVERSE
-    if (left_tps  < 0.0f) left_tps  = 0.0f;
-    if (right_tps < 0.0f) right_tps = 0.0f;
-    #endif
+    // Final Output
+    float output = p_term + i_term + d_term;
+    
+    // Output limiting
+    output = clampf(output, -g_params.steer_clamp, +g_params.steer_clamp);
 
-    // 10) Set outputs
-    // (unchanged)
+    // 5. Motor Mixing
+    // Error Positive (White) -> Turn Right (Left + Out, Right - Out)
+    // Error Negative (Black) -> Turn Left  (Left - Out, Right + Out) -> Wait...
+    
+    // Let's re-verify the mixing signs for Negative Error:
+    // Error = -0.5. Output is Negative (e.g., -20).
+    // Left = Base + (-20) = Slows Down.
+    // Right = Base - (-20) = Base + 20 = Speeds Up.
+    // Result: Right Wheel Fast, Left Wheel Slow -> Turn Left. CORRECT.
+    
+    float left_tps  = (base_speed_tps * g_params.base_scale) + output;
+    float right_tps = (base_speed_tps * g_params.base_scale) - output;
+
+    // 6. Outputs
+    if (left_tps < 0) left_tps = 0;
+    if (right_tps < 0) right_tps = 0;
+
     *out_target_left_tps  = left_tps;
     *out_target_right_tps = right_tps;
     if (out_R_adc) *out_R_adc = R_adc;
-
-    // 11) Set state for telemetry
-    // (unchanged)
-    if (out_state_name) {
-        if (line_is_lost_white) {
-            *out_state_name = (g_current_state == TRACK_RIGHT_EDGE) ? STATE_NAME_LOST_W_R : STATE_NAME_LOST_W_L;
-        } else if (R_norm > 0.9f) {
-            *out_state_name = STATE_NAME_LOST_B;
-        } else {
-            *out_state_name = (g_current_state == TRACK_RIGHT_EDGE) ? STATE_NAME_TRACK_R : STATE_NAME_TRACK_L;
-        }
-    }
-
-    // 12) --- NEW: Output timer value for tuning ---
-    if (out_time_lost_ms) {
-        *out_time_lost_ms = g_time_lost_ms;
-    }
 }

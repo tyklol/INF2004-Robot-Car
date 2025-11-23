@@ -92,135 +92,129 @@ void indicate_state_led(int scenario) {
 /**
  * @brief MODIFIED: Helper function to load tuning params for all 4 scenarios.
  */
-void apply_scenario_tune(int scenario) {
-    printf("\n--- CONFIGURING SCENARIO %d ---\n", scenario);
+// void apply_scenario_tune(int scenario) {
+//     printf("\n--- CONFIGURING SCENARIO %d ---\n", scenario);
     
-    // Default values (from your "Balanced & Fast" tune)
-    float kp = 32.0f;
-    float ki = 0.0f;
-    float kd = 0.6f;
-    float steer_clamp = 30.0f;
-    float base_scale = 1.0f;
-    float curve_slowdown = 0.7f;
-    float curve_exp = 1.3f;
-    float min_speed_frac = 0.25f;
+//     // Default values (from your "Balanced & Fast" tune)
+//     float kp = 32.0f;
+//     float ki = 0.0f;
+//     float kd = 0.6f;
+//     float steer_clamp = 30.0f;
+//     float base_scale = 1.0f;
+//     float curve_slowdown = 0.7f;
+//     float curve_exp = 1.3f;
+//     float min_speed_frac = 0.25f;
 
-    // --- 
-    // --- !!! YOUR FINAL TUNED VALUES GO HERE !!! ---
-    // --- 
-    // (Values from your logs)
-    uint32_t final_timeout_R_L = 1200; // (Based on 228ms max wobble)
-    uint32_t final_timeout_L_R = 1200; // (Based on 453ms max wobble)
-    // ---
-    // ---
-    uint32_t running_timeout = 800;  // Safe value for normal running
-    uint32_t tuning_timeout = 5000;   // Safe value for tuning modes
+//     // --- 
+//     // --- !!! YOUR FINAL TUNED VALUES GO HERE !!! ---
+//     // --- 
+//     // (Values from your logs)
+//     uint32_t final_timeout_R_L = 1200; // (Based on 228ms max wobble)
+//     uint32_t final_timeout_L_R = 1200; // (Based on 453ms max wobble)
+//     // ---
+//     // ---
+//     uint32_t running_timeout = 800;  // Safe value for normal running
+//     uint32_t tuning_timeout = 5000;   // Safe value for tuning modes
 
-    switch (scenario) {
-        case 0: // STOPPED
-            g_line_follow_power = 0.0f;
-            printf("MODE: STOPPED (Scenario 0)\n");
-            kp = 15.0f; kd = 0.0f; steer_clamp = 20.0f; // Use safe/default params
-            ir_reset_robot_state(); // Reset to default (RIGHT_EDGE) and reset PID
-            break;
+//     switch (scenario) {
+//         case 0: // STOPPED
+//             g_line_follow_power = 0.0f;
+//             printf("MODE: STOPPED (Scenario 0)\n");
+//             kp = 15.0f; kd = 0.0f; steer_clamp = 20.0f; // Use safe/default params
+//             ir_reset_robot_state(); // Reset to default (RIGHT_EDGE) and reset PID
+//             break;
         
-        case 1: // "RUN" Mode - CENTERLINE TRACKING
-            g_line_follow_power = 45.0f;
-            printf("MODE: RUN (Adaptive Edge Tracking)\n");
+//         case 1: // "RUN" Mode - CENTERLINE TRACKING
+//             g_line_follow_power = 45.0f;
+//             printf("MODE: RUN (Adaptive Edge Tracking)\n");
             
-            // Use EXACT same parameters as Case 2/3 (they work!)
-            base_scale = 1.05f;
-            curve_exp = 1.1f;
+//             // Use EXACT same parameters as Case 2/3 (they work!)
+//             base_scale = 1.05f;
+//             curve_exp = 1.1f;
             
-            // CONSERVATIVE timeouts - only switch when truly lost
-            final_timeout_R_L = running_timeout;  // 800ms before switching R->L
-            final_timeout_L_R = running_timeout;  // 800ms before switching L->R
-            // Start on RIGHT edge (works for anticlockwise startup)
-            // Will auto-switch to LEFT edge if track is clockwise
-            ir_force_state(IR_STATE_TRACK_RIGHT);
-            break;
+//             // CONSERVATIVE timeouts - only switch when truly lost
+//             final_timeout_R_L = running_timeout;  // 800ms before switching R->L
+//             final_timeout_L_R = running_timeout;  // 800ms before switching L->R
+//             // Start on RIGHT edge (works for anticlockwise startup)
+//             // Will auto-switch to LEFT edge if track is clockwise
+//             ir_force_state(IR_STATE_TRACK_RIGHT);
+//             break;
 
-        case 2: // "TUNE" Mode (Right-to-Left)
-            // g_line_follow_power = 40.0f;
-            // kp = 40.0f;       // from KP_SINGLE
-            // ki = 0.0f;       // from KI_SINGLE
-            // kd = 2.0f;       // from KD_SINGLE
-            // steer_clamp = 30.0f;   // from STEER_CLAMP_TPS
-            // base_scale = 0.85f;   // from BASE_SPEED_SCALE
-            // curve_slowdown = 0.70f;  // from CURVE_SLOWDOWN
-            // curve_exp = 1.6f;    // from CURVE_EXP
-            // min_speed_frac = 0.30f;  // from MIN_SPEED_FRACTION
-            // printf("MODE: TUNE R->L | Forcing RIGHT_EDGE\n");
-            // ir_set_tuning_params(kp, ki, kd, steer_clamp, base_scale, 
-            //                      curve_slowdown, curve_exp, min_speed_frac, 
-            //                      tuning_timeout, tuning_timeout);
+//         case 2: // "TUNE" Mode (Right-to-Left)
+//             // g_line_follow_power = 40.0f;
+//             // kp = 40.0f;       // from KP_SINGLE
+//             // ki = 0.0f;       // from KI_SINGLE
+//             // kd = 2.0f;       // from KD_SINGLE
+//             // steer_clamp = 30.0f;   // from STEER_CLAMP_TPS
+//             // base_scale = 0.85f;   // from BASE_SPEED_SCALE
+//             // curve_slowdown = 0.70f;  // from CURVE_SLOWDOWN
+//             // curve_exp = 1.6f;    // from CURVE_EXP
+//             // min_speed_frac = 0.30f;  // from MIN_SPEED_FRACTION
+//             // printf("MODE: TUNE R->L | Forcing RIGHT_EDGE\n");
+//             // ir_set_tuning_params(kp, ki, kd, steer_clamp, base_scale, 
+//             //                      curve_slowdown, curve_exp, min_speed_frac, 
+//             //                      tuning_timeout, tuning_timeout);
 
-            g_line_follow_power = 45.0f;
-            kd = 1.0f;
-            base_scale = 1.00f;
-            curve_exp = 1.1f;
-            final_timeout_R_L = tuning_timeout;
-            final_timeout_L_R = tuning_timeout;
-            printf("MODE: TUNE R->L | Forcing RIGHT_EDGE\n");
-            ir_force_state(IR_STATE_TRACK_RIGHT); // Force RIGHT_EDGE and reset PID
-            break;
+//             g_line_follow_power = 45.0f;
+//             kd = 1.0f;
+//             base_scale = 1.00f;
+//             curve_exp = 1.1f;
+//             final_timeout_R_L = tuning_timeout;
+//             final_timeout_L_R = tuning_timeout;
+//             printf("MODE: TUNE R->L | Forcing RIGHT_EDGE\n");
+//             ir_force_state(IR_STATE_TRACK_RIGHT); // Force RIGHT_EDGE and reset PID
+//             break;
 
-        case 3: // "TUNE" Mode (Left-to-Right)
-            g_line_follow_power = 45.0f;
-            kd = 1.0f;
-            base_scale = 1.00f;
-            curve_exp = 1.1f;
-            final_timeout_R_L = tuning_timeout;
-            final_timeout_L_R = tuning_timeout;
-            printf("MODE: TUNE L->R | Forcing LEFT_EDGE\n");
-            ir_force_state(IR_STATE_TRACK_LEFT); // Force LEFT_EDGE and reset PID
-            break;
-    }
-    ir_set_tuning_params(kp, ki, kd, steer_clamp, base_scale, 
-                                 curve_slowdown, curve_exp, min_speed_frac, 
-                                 final_timeout_R_L, final_timeout_L_R);
+//         case 3: // "TUNE" Mode (Left-to-Right)
+//             g_line_follow_power = 45.0f;
+//             kd = 1.0f;
+//             base_scale = 1.00f;
+//             curve_exp = 1.1f;
+//             final_timeout_R_L = tuning_timeout;
+//             final_timeout_L_R = tuning_timeout;
+//             printf("MODE: TUNE L->R | Forcing LEFT_EDGE\n");
+//             ir_force_state(IR_STATE_TRACK_LEFT); // Force LEFT_EDGE and reset PID
+//             break;
+//     }
+//     ir_set_tuning_params(kp, ki, kd, steer_clamp, base_scale, 
+//                                  curve_slowdown, curve_exp, min_speed_frac, 
+//                                  final_timeout_R_L, final_timeout_L_R);
     
-    // ---
-    // THE BUG WAS LIKELY A STRAY ir_reset_robot_state(); CALL HERE.
-    // MAKE SURE IT IS GONE.
-    // ---
-}
+//     // ---
+//     // THE BUG WAS LIKELY A STRAY ir_reset_robot_state(); CALL HERE.
+//     // MAKE SURE IT IS GONE.
+//     // ---
+// }
 
+bool g_is_running = false;
+uint16_t val_white = 0;
+uint16_t val_black = 0;
 /**
  * @brief MASTER ISR for BUTTONS
  * MODIFIED: Cycles scenarios 0-3
  */
 void gpio_interrupt_handler(uint gpio, uint32_t events) {
-    if (gpio == BUTTON_MODE_CALIBRATE || gpio == BUTTON_MODE_START_STOP) {
-        uint32_t now = time_us_32();
-        if (now - last_button_press_time < DEBOUNCE_TIME_US) {
-            return;
-        }
-        last_button_press_time = now;
+    static int cal_step = 0;
+    static uint32_t last_time = 0;
+    uint32_t now = to_ms_since_boot(get_absolute_time());
+    if (now - last_time < 300) return; // Debounce
+    last_time = now;
 
-        if (gpio == BUTTON_MODE_CALIBRATE) {
-            // (Calibration logic unchanged)
-            if (current_state == STATIONARY_NOT_CALIBRATED) {
-                current_state = CALIBRATE_WHITE_START;
-            } else if (current_state == CALIBRATE_WHITE_START) {
-                current_state = CALIBRATE_WHITE_END;
-            } else if (current_state == CALIBRATE_WHITE_END) {
-                current_state = CALIBRATE_BLACK_START;
-            } else if (current_state == CALIBRATE_BLACK_START) {
-                current_state = CALIBRATED_STOPPED;
-            } else if (current_state == CALIBRATED_STOPPED) {
-                current_state = STATIONARY_NOT_CALIBRATED;
-                g_is_calibrated = false;
-                g_current_scenario = 0;
-            }
-        } else if (gpio == BUTTON_MODE_START_STOP) {
-            // Scenario Cycle Button Logic
-            if (g_is_calibrated) {
-                // --- MODIFIED: Cycle 0, 1, 2, 3 ---
-                g_current_scenario = (g_current_scenario + 1) % 4; 
-            }
-        }
-        needs_update = true;
+    if (cal_step == 0) {
+        val_white = ir_read_single_sensor_raw();
+        printf("WHITE saved: %d. Place on BLACK and press button.\n", val_white);
+        g_current_ir_state = "CALIBRATING WHITE";
+        cal_step++;
+    } else if (cal_step == 1) {
+        val_black = ir_read_single_sensor_raw();
+        ir_set_calibration_values(val_white, val_black);
+        g_is_calibrated = true;
+        printf("BLACK saved: %d. Ready! Press to RUN.\n", val_black);
+        g_current_ir_state = "CALIBRATING BLACK";
+        cal_step++;
+    } else {
+        g_is_running = !g_is_running;
+        printf(g_is_running ? "RUNNING!\n" : "STOPPED.\n");
     }
 }
 
@@ -229,106 +223,30 @@ void gpio_interrupt_handler(uint gpio, uint32_t events) {
  */
 void main_control_task(__unused void *params) {
     vTaskDelay(pdMS_TO_TICKS(500));
-    printf("Main control task started (4-Mode Tuning Ready).\n");
+    printf("Control Task Started.\n");
+    
+    // Default Speed (Tickets Per Second? Or %? Adjust to your motor driver)
+    float base_speed = 35.0f; 
+    
+    float target_L = 0;
+    float target_R = 0;
+    uint16_t current_adc = 0;
 
     for (;;) {
-        // (Encoder poll unchanged)
-        int32_t delta_ticks_left, delta_ticks_right;
-        encoder_update_and_get_ticks(&delta_ticks_left, &delta_ticks_right);
-        g_total_ticks_left = encoder_get_total_ticks_left();
-        g_total_ticks_right = encoder_get_total_ticks_right();
-
-        // (State change logic unchanged)
-        if (needs_update) {
-            needs_update = false;
-            encoder_reset_total_ticks();
-            g_total_ticks_left = 0;
-            g_total_ticks_right = 0;
-
-            switch (current_state) {
-                case STATIONARY_NOT_CALIBRATED:
-                    g_current_ir_state = "NO_CAL";
-                    printf("Mode: NOT CALIBRATED. Press GP21 to start.\n");
-                    break;
-                case CALIBRATE_WHITE_START:
-                    g_current_ir_state = "CAL_WHITE";
-                    printf("Mode: Place sensor on WHITE, press GP21 to save.\n");
-                    break;
-                case CALIBRATE_WHITE_END:
-                    g_current_ir_state = "CAL_WHITE_END";
-                    g_calib_white = ir_read_single_sensor_raw();
-                    printf("Mode: Place sensor on WHITE, press GP21 to save.\n");
-                    break;
-                case CALIBRATE_BLACK_START:
-                    g_current_ir_state = "CAL_BLACK";
-                    printf("WHITE saved: %u. Place on BLACK, press GP21 to save.\n", g_calib_white);
-                    break;
-                case CALIBRATED_STOPPED:
-                    g_calib_black = ir_read_single_sensor_raw();
-                    ir_set_calibration_values(g_calib_white, g_calib_black);
-                    g_is_calibrated = true;
-                    g_current_ir_state = "CAL_STOP";
-                    printf("BLACK saved: %u. CALIBRATED! Press GP20 to cycle scenarios.\n", g_calib_black);
-                    printf("Calibration Range: %d (should be > 500)\n", (int)(g_calib_black - g_calib_white));
-                    break;
-            }
-
-            if (g_is_calibrated) {
-                apply_scenario_tune(g_current_scenario);
-                indicate_state_led(g_current_scenario);
-            }   
-        }
-        get_filtered_heading(raw_accel_data, raw_mag_data, filtered_accel, filtered_mag,
-            &roll_deg, &pitch_deg, &yaw_deg);
-
-        float yaw_rate_dps = imu_get_yaw_rate();
-
-        // --- Calculate Target Motor Power ---
-        if (g_current_scenario > 0 && g_is_calibrated) { // Scenarios 1, 2, or 3
+        if (g_is_running && g_is_calibrated) {
             
-            // --- MODIFIED: Add new argument for lost time ---
-            ir_follow_line_single(g_line_follow_power,
-                                  &g_target_power_left, 
-                                  &g_target_power_right,
-                                  &g_sensor_R,
-                                  &g_current_ir_state,
-                                  &g_current_lost_time_ms,
-                                  yaw_rate_dps);
-        } else { // Scenario 0 (STOP) or not calibrated
-            g_target_power_left = 0.0f;
-            g_target_power_right = 0.0f;
-            g_current_lost_time_ms = 0;
-        }
-
-        // --- Actuate Motors ---
-        motor_set_speed(MOTOR_LEFT, g_target_power_left);
-        motor_set_speed(MOTOR_RIGHT, g_target_power_right);
-
-        // --- Print Debugging Information ---
-        // uint32_t now_ms = to_ms_since_boot(get_absolute_time());
-        // if (now_ms - g_last_print_time > PRINT_DELAY_MS) {
-        //     g_last_print_time = now_ms;
+            // CALL THE SIMPLIFIED PID FUNCTION
+            ir_follow_line_single(base_speed, &target_L, &target_R, &current_adc);
             
-        //     if (g_current_scenario > 0) {
-        //         // --- MODIFIED: Added L_ms (Lost Time in ms) ---
-        //         printf("SCEN %d: %-10s| Pwr_L:%6.1f Pwr_R:%6.1f | Tick_L:%6ld Tick_R:%6ld | ADC:%4u | L_ms:%5u\n",
-        //                g_current_scenario,
-        //                g_current_ir_state,
-        //                g_target_power_left,
-        //                g_target_power_right,
-        //                g_total_ticks_left,
-        //                g_total_ticks_right,
-        //                g_sensor_R,
-        //                g_current_lost_time_ms); // <-- NEW
-        //     } else {
-        //          printf("STOPPED | State: %-10s| Tick_L:%6ld Tick_R:%6ld | ADC:%4u | L_ms:%5u\n",
-        //                g_current_ir_state,
-        //                g_total_ticks_left,
-        //                g_total_ticks_right,
-        //                ir_read_single_sensor_raw(),
-        //                g_current_lost_time_ms); // <-- NEW
-        //     }
-        // }
+            // Actuate
+            motor_set_speed(MOTOR_LEFT, target_L);
+            motor_set_speed(MOTOR_RIGHT, target_R);
+
+        } else {
+            // Stop motors if not running
+            motor_set_speed(MOTOR_LEFT, 0);
+            motor_set_speed(MOTOR_RIGHT, 0);
+        }
 
         vTaskDelay(pdMS_TO_TICKS(CONTROL_LOOP_MS));
     }
@@ -369,7 +287,7 @@ void network_task(__unused void *params) {
                 g_total_ticks_left,
                 g_total_ticks_right,
                 g_current_scenario > 0 ? g_sensor_R : ir_read_single_sensor_raw(),
-                g_current_lost_time_ms, g_current_state);
+                g_current_lost_time_ms, 1);
             mqtt_pub_imu_raw(&mqtt_state,
                 raw_accel_data[0], raw_accel_data[1], raw_accel_data[2],
                 raw_mag_data[0], raw_mag_data[1], raw_mag_data[2]
