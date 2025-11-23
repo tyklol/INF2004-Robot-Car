@@ -17,6 +17,8 @@
         "obstacle_detector.h": "c",
         "stdlib.h": "c",
         "pwm.h": "c",
-        "stdint.h": "c"
+        "stdint.h": "c",
+        "led.h": "c",
+        "clocks.h": "c"
     }
 }
