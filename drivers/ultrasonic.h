@@ -24,4 +24,5 @@ float calculate_universal_width(float dist_center, int left_raw, int right_raw);
 // Returns the calculated width, or -1.0 if failed
 float perform_full_scan_routine(float center_dist);
 
+int scan_for_clear_path(void);
 #endif

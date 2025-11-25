@@ -181,3 +181,38 @@ float perform_full_scan_routine(float center_dist) {
     }
     return -1.0f; // Failed
 }
+
+int scan_for_clear_path(void) {
+    float left_score = 0;
+    float right_score = 0;
+    
+    // 1. Check RIGHT side (approx 45 degrees)
+    set_servo_angle(45);
+    sleep_ms(300); // Wait for servo to move
+    float d_right = get_median_distance(5);
+    if (d_right == -1.0f) d_right = 300.0f; // No echo = infinite space
+    right_score = d_right;
+    
+    // 2. Check LEFT side (approx 135 degrees)
+    set_servo_angle(135);
+    sleep_ms(300);
+    float d_left = get_median_distance(5);
+    if (d_left == -1.0f) d_left = 300.0f;
+    left_score = d_left;
+
+    // 3. Center the servo back
+    set_servo_angle(90);
+    sleep_ms(200);
+
+    printf("Deciding Path: Left Space=%.1f, Right Space=%.1f\n", left_score, right_score);
+
+    // 4. Decision Logic
+    // If Left has significantly more space (buffer of 10cm), go Left.
+    if (left_score > (right_score + 10.0f)) {
+        return -1; // Go LEFT
+    }
+    // Otherwise go RIGHT (Default preference if equal)
+    else {
+        return 1;  // Go RIGHT
+    }
+}
