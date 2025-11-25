@@ -1,127 +1,161 @@
-#include "ir.h"
-#include "pico/stdlib.h"
+#include "./ir.h"
 #include "hardware/adc.h"
+#include "pico/stdlib.h"
 #include <math.h>
-#include <stdio.h>
 
-// --- Helper Functions ---
-static inline float clampf(float x, float lo, float hi) {
-    return x < lo ? lo : (x > hi ? hi : x);
-}
+#define PIN_IR_RIGHT_ADC_GPIO   26
+#define PIN_IR_RIGHT_ADC_CH     0
 
-static uint16_t adc_read_avg(uint ch, int samples) {
-    adc_select_input(ch);
-    uint32_t acc = 0;
-    for (int i = 0; i < samples; i++) acc += adc_read();
-    return (uint16_t)(acc / samples);
-}
+// --- Globals ---
+static uint16_t g_calib_white = 0;
+static uint16_t g_calib_black = 4095;
 
-// ===== Public API =====
+// --- STRONG SETTINGS (For Curves) ---
+// Passed in from main.c
+static float g_kp_strong = 45.0f;
+static float g_ki_strong = 0.0f;
+static float g_kd_strong = 8.0f;       
 
-void ir_set_tuning_params(float kp, float ki, float kd, 
-                          float steer_clamp, float base_scale) 
-{
-    g_params.kp = kp;
-    g_params.ki = ki;
-    g_params.kd = kd;
-    g_params.steer_clamp = steer_clamp;
-    g_params.base_scale = base_scale;
-}
+// --- WEAK SETTINGS (For Straights) ---
+// UPDATED: Kp Lowered (8.0), Kd Tripled (6.0)
+// This makes it very "heavy" and stable on straights.
+static float g_kp_weak = 8.0f;  
+static float g_ki_weak = 0.0f;
+static float g_kd_weak = 6.0f; 
+
+static float g_clamp = 60.0f;   
+static float g_curve_slowdown = 0.5f; 
+static float g_min_speed_frac = 0.4f;
+
+// State
+static float prev_error = 0.0f;
+static float integral = 0.0f;
+
+// Hysteresis State
+static bool g_in_strong_mode = false;
+static uint32_t g_last_switch_time = 0;
 
 void ir_init(void) {
-    ir_reset_pid_state();
+    adc_init();
+    adc_gpio_init(PIN_IR_RIGHT_ADC_GPIO);
+    adc_select_input(PIN_IR_RIGHT_ADC_CH);
+}
+
+void ir_set_calibration_values(uint16_t white_val, uint16_t black_val) {
+    g_calib_white = white_val;
+    g_calib_black = black_val;
+}
+
+void ir_set_tuning_params(float kp, float ki, float kd, 
+                          float steer_clamp, float alpha, 
+                          float curve_slowdown, float curve_exp,
+                          float min_speed_frac) {
+    g_kp_strong = kp; 
+    g_ki_strong = ki; 
+    g_kd_strong = kd;
+    g_clamp = steer_clamp;
+    g_curve_slowdown = curve_slowdown;
+    g_min_speed_frac = min_speed_frac;
 }
 
 void ir_reset_pid_state(void) {
-    pid_integral = 0.0f;
-    pid_last_error = 0.0f;
-    pid_last_time = get_absolute_time();
+    prev_error = 0.0f;
+    integral = 0.0f;
+    g_in_strong_mode = false;
 }
 
-void ir_set_calibration_values(uint16_t white, uint16_t black) {
-    SENSOR_WHITE = (float)white;
-    SENSOR_BLACK = (float)black;
-    // Safety check to prevent division by zero
-    if (fabsf(SENSOR_BLACK - SENSOR_WHITE) < 100.0f) {
-        SENSOR_BLACK = SENSOR_WHITE + 500.0f;
+uint16_t ir_read_smooth(void) {
+    uint32_t sum = 0;
+    adc_select_input(PIN_IR_RIGHT_ADC_CH);
+    for(int i=0; i<8; i++) sum += adc_read();
+    return (uint16_t)(sum / 8);
+}
+
+void ir_follow_line_single(float base_speed, 
+                           float *out_left, float *out_right, 
+                           uint16_t *out_raw_sensor,
+                           const char **out_state_str,
+                           uint32_t *out_lost_time) {
+    
+    uint16_t raw = ir_read_smooth();
+    if(out_raw_sensor) *out_raw_sensor = raw;
+
+    float range = (float)(g_calib_black - g_calib_white);
+    if (range < 100) range = 100;
+
+    float val = (float)raw;
+    if (val < g_calib_white) val = g_calib_white;
+    if (val > g_calib_black) val = g_calib_black;
+
+    // Normalized: 0.0 (White) ... 0.5 (Edge) ... 1.0 (Black)
+    float normalized = (val - g_calib_white) / range;
+    float error = normalized - 0.5f;
+
+    // --- GAIN SCHEDULING WITH HYSTERESIS ---
+    float use_kp, use_ki, use_kd;
+    float abs_err = fabsf(error);
+    uint32_t now = to_ms_since_boot(get_absolute_time());
+
+    // Thresholds
+    float trigger_strong = 0.12f; // Trigger strong earlier (was 0.15)
+    float reset_weak = 0.08f;     // Go back to weak only when very centered
+
+    if (g_in_strong_mode) {
+        // We are in STRONG mode. Stay here until error is tiny AND time has passed.
+        if (abs_err < reset_weak && (now - g_last_switch_time > 100)) {
+            g_in_strong_mode = false;
+            g_last_switch_time = now;
+        }
+    } else {
+        // We are in WEAK mode. Switch if error gets big.
+        if (abs_err > trigger_strong) {
+            g_in_strong_mode = true;
+            g_last_switch_time = now;
+        }
     }
-    printf("IR Calibrated: White=%.0f Black=%.0f\n", SENSOR_WHITE, SENSOR_BLACK);
-}
 
-uint16_t ir_read_single_sensor_raw(void) {
-    return adc_read_avg(PIN_IR_RIGHT_ADC_CH, ADC_SAMPLES);
-}
-
-/**
- * @brief Simplified Single Sensor Line Follower (Left Edge Strategy)
- */
-void ir_follow_line_single(float base_speed_tps,
-                           float *out_target_left_tps, float *out_target_right_tps,
-                           uint16_t *out_R_adc) {
-    
-    // 1. Read & Normalize Sensor
-    uint16_t R_adc = adc_read_avg(PIN_IR_RIGHT_ADC_CH, ADC_SAMPLES);
-    
-    // Normalize to 0.0 (White) to 1.0 (Black)
-    float R_norm = (R_adc - SENSOR_WHITE) / (SENSOR_BLACK - SENSOR_WHITE);
-    R_norm = clampf(R_norm, 0.0f, 1.0f);
-
-    // 2. Calculate Delta Time
-    absolute_time_t now = get_absolute_time();
-    float dt_s = absolute_time_diff_us(pid_last_time, now) / 1e6f;
-    if (dt_s <= 0.0f || dt_s > 0.1f) dt_s = 0.01f;
-    pid_last_time = now;
-
-    // 3. Calculate Error (LEFT EDGE STRATEGY)
-    // Target is 0.5.
-    // White (0.0) -> Error = +0.5 (Turn Right)
-    // Black (1.0) -> Error = -0.5 (Turn Left)
-    float error = PID_SETPOINT - R_norm;
-
-    // --- FIX: ASYMMETRIC GAIN ---
-    // If Error is NEGATIVE, we are seeing BLACK (Scenario B).
-    // We risk crossing the line. We must react HARDER here.
-    float current_kp = g_params.kp;
-    if (error < 0) {
-        current_kp = g_params.kp * 2.5f; // 2.5x stronger reaction to Black
+    if (g_in_strong_mode) {
+        use_kp = g_kp_strong;
+        use_ki = g_ki_strong;
+        use_kd = g_kd_strong;
+        *out_state_str = "CURVE(STRONG)";
+    } else {
+        use_kp = g_kp_weak;
+        use_ki = g_ki_weak;
+        use_kd = g_kd_weak;
+        *out_state_str = "STRT(WEAK)";
     }
-    // ----------------------------
 
-    // 4. PID Calculation
-    float p_term = current_kp * error;
+    // PID Calculation
+    float p_term = error * use_kp;
+    integral += error;
+    float i_term = integral * use_ki;
+    float d_term = (error - prev_error) * use_kd;
+    prev_error = error;
 
-    pid_integral += error * dt_s;
-    pid_integral = clampf(pid_integral, -10.0f, 10.0f);
-    float i_term = g_params.ki * pid_integral;
+    float steering = p_term + i_term + d_term;
 
-    float derivative = (error - pid_last_error) / dt_s;
-    pid_last_error = error;
-    float d_term = g_params.kd * derivative;
+    // Clamp
+    if (steering > g_clamp) steering = g_clamp;
+    if (steering < -g_clamp) steering = -g_clamp;
 
-    // Final Output
-    float output = p_term + i_term + d_term;
-    
-    // Output limiting
-    output = clampf(output, -g_params.steer_clamp, +g_params.steer_clamp);
+    // Curve Slowdown
+    float turn_severity = fabsf(steering) / g_clamp; 
+    float speed_factor = 1.0f - (turn_severity * g_curve_slowdown);
+    if (speed_factor < g_min_speed_frac) speed_factor = g_min_speed_frac;
 
-    // 5. Motor Mixing
-    // Error Positive (White) -> Turn Right (Left + Out, Right - Out)
-    // Error Negative (Black) -> Turn Left  (Left - Out, Right + Out) -> Wait...
-    
-    // Let's re-verify the mixing signs for Negative Error:
-    // Error = -0.5. Output is Negative (e.g., -20).
-    // Left = Base + (-20) = Slows Down.
-    // Right = Base - (-20) = Base + 20 = Speeds Up.
-    // Result: Right Wheel Fast, Left Wheel Slow -> Turn Left. CORRECT.
-    
-    float left_tps  = (base_speed_tps * g_params.base_scale) + output;
-    float right_tps = (base_speed_tps * g_params.base_scale) - output;
+    float final_speed = base_speed * speed_factor;
 
-    // 6. Outputs
-    if (left_tps < 0) left_tps = 0;
-    if (right_tps < 0) right_tps = 0;
+    *out_left = final_speed + steering;
+    *out_right = final_speed - steering;
 
-    *out_target_left_tps  = left_tps;
-    *out_target_right_tps = right_tps;
-    if (out_R_adc) *out_R_adc = R_adc;
+    // Lost line logic
+    static uint32_t lost_start = 0;
+    if (normalized < 0.05f || normalized > 0.95f) {
+        if (lost_start == 0) lost_start = to_ms_since_boot(get_absolute_time());
+        *out_lost_time = to_ms_since_boot(get_absolute_time()) - lost_start;
+    } else {
+        lost_start = 0;
+        *out_lost_time = 0;
+    }
 }

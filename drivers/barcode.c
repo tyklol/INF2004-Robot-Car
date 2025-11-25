@@ -462,9 +462,12 @@ static void start_new_scan(void)
     S.have_run = false;
     S.cur_len = 0;
     S.pend_len = 0;
-    S.last_syms[0] = '\0';
-    S.last_payload[0] = '\0';
-    S.last_cmd[0] = '\0';
+
+    // --- CHANGE START: Do NOT clear these here. Keep them until read. ---
+    // S.last_syms[0] = '\0';
+    // S.last_payload[0] = '\0';
+    // S.last_cmd[0] = '\0';
+    // --- CHANGE END ---
 }
 
 // Decoding helpers
@@ -733,7 +736,12 @@ void barcode_get_nw_info(bool *seeded, uint16_t *narrow_base, uint16_t *wide_thr
     if (factor_num) *factor_num = NW_FACTOR_NUM;
     if (factor_den) *factor_den = NW_FACTOR_DEN;
 }
-
+void barcode_clear_result(void)
+{
+    S.last_syms[0] = '\0';
+    S.last_payload[0] = '\0';
+    S.last_cmd[0] = '\0';
+}
 const char *barcode_last_symbols(void) { return S.last_syms; }
 const char *barcode_last_payload(void) { return S.last_payload; }
 const char *barcode_last_command(void) { return S.last_cmd; }

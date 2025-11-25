@@ -19,6 +19,9 @@
         "pwm.h": "c",
         "stdint.h": "c",
         "led.h": "c",
-        "clocks.h": "c"
+        "clocks.h": "c",
+        "functional": "c",
+        "atomic": "c",
+        "string.h": "c"
     }
 }

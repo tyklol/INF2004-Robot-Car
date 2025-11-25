@@ -24,7 +24,7 @@ typedef struct {
 // Lifecycle
 void barcode_init(void);
 void barcode_calibrate(void);
-
+void barcode_clear_result(void);
 // Classifier accessors
 uint16_t barcode_read_adc_raw(void);
 uint16_t barcode_last_adc(void);
