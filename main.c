@@ -86,6 +86,11 @@ int g_obs_dir = 0;               // 1 = right, -1 = left
 float g_obs_base_heading = 0.0f; // reference heading
 uint32_t g_obs_timer_start = 0;  // timer for blind moves
 
+// --- barcode shared globals ---
+volatile bool g_barcode_received = false;
+char g_last_barcode_cmd[8] = "NONE";
+char g_last_barcode_payload[60] = "";
+
 // --- adc helper (thread safe) ---
 uint16_t ir_read_single_sensor_raw_local(void) {
     taskENTER_CRITICAL();
@@ -184,6 +189,9 @@ void main_control_task(__unused void *params) {
     
     set_servo_angle(CENTER_ANGLE);
 
+    // ensure barcode calibration runs only once per calibration cycle
+    static bool barcode_cal_done = false;
+
     for (;;) {
         imu_get_heading();
         
@@ -198,6 +206,9 @@ void main_control_task(__unused void *params) {
                 current_state = STATIONARY_NOT_CALIBRATED;
                 g_is_calibrated = false;
                 g_is_running = false;
+
+                // allow barcode recalibration next time
+                barcode_cal_done = false;
             }
         }
 
@@ -252,6 +263,27 @@ void main_control_task(__unused void *params) {
                 ir_set_calibration_values(150, 900);
                 g_is_calibrated = true;
                 current_state = CALIBRATED_STOPPED;
+
+                // barcode calibration AFTER line calibration, once.
+                if (!barcode_cal_done) {
+                    // stop motors during barcode calibration for safety
+                    g_is_running = false;
+                    motor_set_speed(MOTOR_LEFT, 0);
+                    motor_set_speed(MOTOR_RIGHT, 0);
+
+                    printf("\n=== Barcode Calibration (Option B) ===\n");
+                    printf("Step 1: Place BARCODE sensor on WHITE.\n");
+                    printf("        Hold GP21 for 1s to capture WHITE.\n");
+                    printf("Step 2: Place BARCODE sensor on BLACK bar.\n");
+                    printf("        Hold GP21 for 1s to capture BLACK.\n\n");
+
+                    barcode_calibrate();
+                    barcode_cal_done = true;
+
+                    printf("=== Barcode Calibration Done ===\n");
+                    printf("Press GP20 to start running.\n\n");
+                }
+
                 update_leds(0, 50, 0, 0, 50, 0); 
                 vTaskDelay(pdMS_TO_TICKS(1000));
                 break;
@@ -396,15 +428,44 @@ void main_control_task(__unused void *params) {
 
 // --- barcode task (high priority) ---
 void barcode_task(__unused void *params) {
+    // background scanner that fills globals for main_control_task
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    printf("\n=== Barcode Task Started (%d Hz) ===\n", BARCODE_SAMPLE_HZ);
+
+    static char prev_payload[60] = "";
+
     for (;;) {
+        // ensure ADC is on barcode channel before stepping
+        taskENTER_CRITICAL();
+        adc_select_input(BARCODE_ADC_CH); // ADC1 for GP27
+        taskEXIT_CRITICAL();
+
         // sampling at 300hz ensures accurate code39 detection
         barcode_step_300hz(); 
 
-        run_t r;
-        // process any detected run-length codes
-        while (barcode_get_next_run(&r)) {
-             // internal decoder logic updates g_barcode_received flag
+        const char *p = barcode_last_payload();
+        const char *c = barcode_last_command();
+
+        // new decode when payload changes (non-empty)
+        if (p && p[0] && strcmp(prev_payload, p) != 0) {
+            strncpy(prev_payload, p, sizeof(prev_payload) - 1);
+            prev_payload[sizeof(prev_payload) - 1] = '\0';
+
+            strncpy(g_last_barcode_payload, p, sizeof(g_last_barcode_payload) - 1);
+            g_last_barcode_payload[sizeof(g_last_barcode_payload) - 1] = '\0';
+
+            if (c && c[0]) {
+                strncpy(g_last_barcode_cmd, c, sizeof(g_last_barcode_cmd) - 1);
+                g_last_barcode_cmd[sizeof(g_last_barcode_cmd) - 1] = '\0';
+            } else {
+                strcpy(g_last_barcode_cmd, "NONE");
+            }
+
+            g_barcode_received = true;
+            printf("[BC] Payload=%s | Cmd=%s\n", g_last_barcode_payload, g_last_barcode_cmd);
         }
+
+        vTaskDelay(pdMS_TO_TICKS(1)); // yield to other tasks
     }
 }
 
@@ -461,9 +522,6 @@ void vLaunch(void) {
     // 3. init buttons
     gpio_init(BUTTON_MODE_CALIBRATE); gpio_set_dir(BUTTON_MODE_CALIBRATE, GPIO_IN); gpio_pull_up(BUTTON_MODE_CALIBRATE);
     gpio_init(BUTTON_MODE_START_STOP); gpio_set_dir(BUTTON_MODE_START_STOP, GPIO_IN); gpio_pull_up(BUTTON_MODE_START_STOP);
-    
-    // blocking calibration for barcode sensors if needed
-    barcode_calibrate(); 
 
     gpio_set_irq_enabled_with_callback(BUTTON_MODE_CALIBRATE, GPIO_IRQ_EDGE_FALL, true, &gpio_interrupt_handler);
     gpio_set_irq_enabled(BUTTON_MODE_START_STOP, GPIO_IRQ_EDGE_FALL, true);
