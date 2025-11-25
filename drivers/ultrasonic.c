@@ -5,6 +5,7 @@
 #include "hardware/gpio.h"
 #include "hardware/pwm.h"
 #include "hardware/timer.h"
+#include "hardware/sync.h"
 #include "ultrasonic.h"
 
 // Internal variables for pin mapping
@@ -30,7 +31,7 @@ void ultrasonic_init(uint trig, uint echo, uint servo) {
 
     // GPIO
     gpio_init(_trig_pin); gpio_set_dir(_trig_pin, GPIO_OUT); gpio_put(_trig_pin, 0);
-    gpio_init(_echo_pin); gpio_set_dir(_echo_pin, GPIO_IN);
+    gpio_init(_echo_pin); gpio_set_dir(_echo_pin, GPIO_IN); gpio_pull_down(_echo_pin);
 
     // PWM for Servo
     gpio_set_function(_servo_pin, GPIO_FUNC_PWM);
@@ -52,21 +53,39 @@ void set_servo_angle(float angle) {
 }
 
 static float read_raw_distance() {
+    // 1. Enter Critical Section (Disable Interrupts)
+    // This ensures no background task messes up the microsecond timing
+    uint32_t status = save_and_disable_interrupts();
+
     gpio_put(_trig_pin, 1);
     sleep_us(10);
     gpio_put(_trig_pin, 0);
 
     absolute_time_t timeout = make_timeout_time_ms(60); 
+    
+    // Wait for Echo HIGH
     while (gpio_get(_echo_pin) == 0) {
-        if (time_reached(timeout)) return -1.0f; 
+        if (time_reached(timeout)) {
+            restore_interrupts(status); // Restore before returning
+            return -1.0f; 
+        }
     }
 
     absolute_time_t start_time = get_absolute_time();
+    
+    // Wait for Echo LOW
     while (gpio_get(_echo_pin) == 1) {
-        if (absolute_time_diff_us(start_time, get_absolute_time()) > 35000) return -1.0f; 
+        if (absolute_time_diff_us(start_time, get_absolute_time()) > 35000) {
+            restore_interrupts(status); // Restore before returning
+            return -1.0f; 
+        }
     }
     
     int64_t pulse_duration = absolute_time_diff_us(start_time, get_absolute_time());
+    
+    // 2. Exit Critical Section
+    restore_interrupts(status);
+
     return (float)pulse_duration * 0.0343f / 2.0f;
 }
 
@@ -83,7 +102,7 @@ float get_median_distance(int samples) {
 
     for(int i=0; i<samples; i++) {
         float d = read_raw_distance();
-        if (d > 2.0f && d < 300.0f) { 
+        if (d > 4.0f && d < 300.0f) { 
             readings[valid_count++] = d;
         }
         sleep_ms(12); 

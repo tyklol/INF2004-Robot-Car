@@ -74,10 +74,7 @@
 // Set to 1 to add the client name to topics, to support multiple devices using the same server
 #ifndef MQTT_UNIQUE_TOPIC
 #define MQTT_UNIQUE_TOPIC 0
-#endif
-
-char g_last_barcode_cmd[32] = {0};
-volatile bool g_barcode_received = false;   
+#endif  
 
 /* Internal helpers (kept static) */
 static float read_onboard_temperature(const char unit) {
@@ -197,12 +194,12 @@ static void mqtt_incoming_data_cb(void *arg, const u8_t *data, u16_t len, u8_t f
         else if (lwip_stricmp((const char *)state->data, "Off") == 0 || strcmp((const char *)state->data, "0") == 0)
             control_led(state, false);
     } else if (strcmp(basic_topic, "/barcode") == 0) {
-        uint16_t copy_len = (len > 31) ? 31 : len;
-        memcpy(g_last_barcode_cmd, data, copy_len);
-        g_last_barcode_cmd[copy_len] = '\0'; // Null terminate
+        // uint16_t copy_len = (len > 31) ? 31 : len;
+        // memcpy(g_last_barcode_cmd, data, copy_len);
+        // g_last_barcode_cmd[copy_len] = '\0'; // Null terminate
         
-        // 2. Set the flag so main.c knows new data is here
-        g_barcode_received = true;
+        // // 2. Set the flag so main.c knows new data is here
+        // g_barcode_received = true;
     } else if (strcmp(basic_topic, "/print") == 0) {
         printf("%.*s\n", len, data);
     } else if (strcmp(basic_topic, "/ping") == 0) {
@@ -497,22 +494,34 @@ void mqtt_pub_telemetry(MQTT_CLIENT_DATA_T *client_data, int g_current_scenario,
                        int32_t g_total_ticks_left,
                        int32_t g_total_ticks_right,
                        uint16_t g_sensor_R,
-                       uint32_t g_current_lost_time_ms, int turn_direction) {
+                       uint32_t g_current_lost_time_ms, float speed, float distance_cm) {
     char buf[256];
-    int n = snprintf(buf, sizeof(buf), "{\"SCEN\": %d, \"IR_State\": %s, \"Pwr_L\": %.1f, \"Pwr_R\": %.1f, \"Ticks_L\": %d, \"Ticks_R\": %d, \"Sensor_R\": %u, \"Lost_ms\": %u, \"State\": %s}",
-                       g_current_scenario,
-                       g_current_ir_state,
+    int n = snprintf(buf, sizeof(buf), "{\"Pwr_L\": %.1f, \"Pwr_R\": %.1f, \"Ticks_L\": %d, \"Ticks_R\": %d, \"IR_Sensor_R\": %u, \"Lost_ms\": %u, \"Speed\": %.2f, \"Distance_cm\": %.2f}",
+                    //    g_current_scenario,
+                    //    g_current_ir_state,
                        g_target_power_left,
                        g_target_power_right,
                        g_total_ticks_left,
                        g_total_ticks_right,
                        g_sensor_R,
                        g_current_lost_time_ms, 
-                       turn_direction == -1? "Turning Left" : turn_direction == 1 ? "Turning Right" : "Not Turning");
+                       speed, distance_cm);
     if (n <= 0 || n >= (int)sizeof(buf)) {
         printf("mqtt_pub_telemetry: snprintf error or buffer too small\n");
     } else {
         mqtt_client_publish(client_data, "robot/telemetry", buf);
+    }
+}
+
+void mqtt_pub_barcode(MQTT_CLIENT_DATA_T *client_data,  char g_last_barcode_cmd[32], char g_last_barcode_payload[60]) {
+    char buf[64];
+    int n = snprintf(buf, sizeof(buf),
+        "{\"g_last_barcode_cmd\": \"%s\", \"g_last_barcode_payload\": \"%s\"}",
+        g_last_barcode_cmd, g_last_barcode_payload);
+    if (n <= 0 || n >= (int)sizeof(buf)) {
+        printf("mqtt_pub_barcode: snprintf error or buffer too small\n");
+    } else {
+        mqtt_client_publish(client_data, "robot/barcode_info", buf);
     }
 }
 /* Thin wrappers for publish/subscribe/disconnect */
@@ -530,7 +539,7 @@ void mqtt_client_publish(MQTT_CLIENT_DATA_T *client_data, const char *topic, con
     // --- END FIX ---
 
     if (err != ERR_OK) {
-        printf("mqtt_publish failed: %d\n", err);
+        // printf("mqtt_publish failed: %d\n", err);
     }
     // mqtt_publish(client_data->mqtt_client_inst, topic, data, strlen(data), MQTT_PUBLISH_QOS, MQTT_PUBLISH_RETAIN, pub_request_cb, client_data);
 }

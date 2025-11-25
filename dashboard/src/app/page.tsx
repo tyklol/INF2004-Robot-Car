@@ -5,6 +5,13 @@ import { useEffect, useState, useMemo } from "react";
 
 type MqttPayload = { topic: string; data: any; time: string };
 
+const TOPIC_ORDER = [
+  "robot/telemetry",
+  "robot/imu/filtered",
+  "robot/obstacle",
+  "robot/barcode_info"
+];
+
 function useMqtt(brokerUrl: string, topic: string) {
   const [messages, setMessages] = useState<MqttPayload[]>([]);
 
@@ -71,7 +78,34 @@ export default function Home() {
       if (!map[m.topic]) map[m.topic] = [];
       map[m.topic].push(m);
     }
-    return Object.entries(map); // [ [topic, msgs], ... ]
+    
+    // Convert to entries array
+    const entries = Object.entries(map);
+
+    // SORTING LOGIC
+    entries.sort((a, b) => {
+      const topicA = a[0];
+      const topicB = b[0];
+      
+      const indexA = TOPIC_ORDER.indexOf(topicA);
+      const indexB = TOPIC_ORDER.indexOf(topicB);
+
+      // 1. If both topics are in our priority list, sort by their index in that list
+      if (indexA !== -1 && indexB !== -1) {
+        return indexA - indexB;
+      }
+
+      // 2. If only topic A is in the list, it goes first
+      if (indexA !== -1) return -1;
+
+      // 3. If only topic B is in the list, it goes first
+      if (indexB !== -1) return 1;
+
+      // 4. If neither are in the list, sort alphabetically (or keep original order)
+      return topicA.localeCompare(topicB);
+    });
+
+    return entries; 
   }, [messages]);
 
   return (

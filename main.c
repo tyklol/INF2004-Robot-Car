@@ -5,75 +5,95 @@
 #include "hardware/gpio.h"
 #include "hardware/adc.h"
 #include "pico/cyw43_arch.h"
+
+// freertos includes
 #include "FreeRTOS.h"
 #include "task.h"
 
-// --- DRIVERS ---
+// driver includes
 #include "drivers/motor.h"
-#include "drivers/ir.h"
-#include "drivers/mqtt.h"
+#include "drivers/ir.h"      
+#include "drivers/mqtt.h"    
+#include "drivers/encoder.h" 
+#include "drivers/ultrasonic.h" 
+#include "led.h" 
+#include "barcode.h" 
 #include "drivers/imu.h"
-#include "led.h"
-#include "barcode.h"
-#include "encoder.h"
-#include "ultrasonic.h" 
 
-// --- PIN DEFINITIONS ---
-#define BUTTON_MODE_GP20        20
-#define BUTTON_MODE_CALIB_START 21
+// --- pin definitions ---
+#define BUTTON_MODE_CALIBRATE   21
+#define BUTTON_MODE_START_STOP  20 
 #define PIN_IR_RIGHT_ADC_GPIO   26
 #define PIN_IR_RIGHT_ADC_CH     0
 
-// Ultrasonic & Servo Pins
-#define TRIG_PIN 17
-#define ECHO_PIN 16
+// --- ultrasonic pins ---
+#define TRIG_PIN 5
+#define ECHO_PIN 4
 #define SERVO_PIN 15
 
-#define DEBOUNCE_TIME_US   200000
-#define CONTROL_LOOP_MS    10
+// --- settings ---
+#define DEBOUNCE_TIME_US   200000 
+#define CONTROL_LOOP_MS    10     
 #define TELEMETRY_PUBLISH_INTERVAL_MS 200
 
-#define BARCODE_TASK_PRIORITY       (tskIDLE_PRIORITY + 3UL)
+// --- task priorities ---
+#define BARCODE_TASK_PRIORITY       (tskIDLE_PRIORITY + 4UL)
+#define ULTRASONIC_TASK_PRIORITY    (tskIDLE_PRIORITY + 3UL) // High priority to catch obstacles fast
 #define MAIN_CONTROL_TASK_PRIORITY  (tskIDLE_PRIORITY + 2UL)
 #define NETWORK_TASK_PRIORITY       (tskIDLE_PRIORITY + 1UL)
 
+// --- state machine for calibration ---
 typedef enum {
     STATIONARY_NOT_CALIBRATED,
-    CALIBRATE_WHITE_WAIT,
-    CALIBRATE_WHITE_SAMPLING,
-    CALIBRATE_BLACK_WAIT,
-    CALIBRATE_BLACK_SAMPLING,
-    CALIBRATED_STOPPED,
+    CALIBRATE_WHITE_WAIT,      
+    CALIBRATE_WHITE_SAMPLING,  
+    CALIBRATE_BLACK_WAIT,      
+    CALIBRATE_BLACK_SAMPLING,  
+    CALIBRATED_STOPPED,        
 } CalibrationState;
 
-// --- Globals ---
+// --- globals ---
 volatile CalibrationState current_state = STATIONARY_NOT_CALIBRATED;
-volatile bool g_btn_action_flag = false;
+volatile bool g_btn_calibrate_flag = false; 
+volatile bool g_btn_start_stop_flag = false;
 volatile uint32_t last_button_press_time = 0;
 
+// driving & calibration globals
 bool g_is_running = false;
 uint16_t g_calib_white = 0;
 uint16_t g_calib_black = 0;
 bool g_is_calibrated = false;
 
-// Drive variables
+// drive variables
+float g_line_follow_power = 38.0f; 
 float g_target_power_left = 0.0f;
 float g_target_power_right = 0.0f;
 uint16_t g_sensor_R = 0;
 const char *g_current_ir_state = "IDLE";
 uint32_t g_current_lost_time_ms = 0;
 
-// Obstacle Avoidance Globals
-volatile int g_maneuver_state = 0; // 0 = Line Follow, 1 = Obstacle Mode
-volatile int g_obs_step = 0;
-volatile float g_measured_width = 0.0f;
-volatile float g_obs_base_heading = 0.0f;
-volatile float g_last_known_dist = 100.0f; // Made global so Network Task can see it
+// ultrasonic telemetry
+float g_measured_width = 0.0f;
+float distance_to_obstacle_cm = 0.0f;
+
+// encoder globals
+volatile float g_current_speed_cms = 0.0f;
+volatile float g_total_distance_cm = 0.0f;
+
+// imu / obstacle avoidance globals
+int g_maneuver_state = 0;        // 0 = idle, 1 = obstacle detour, 2 = intersection turn
+int g_obs_step = 0;              // 1-7 steps for rectangular avoidance
+int g_obs_dir = 0;               // 1 = right, -1 = left
+float g_obs_base_heading = 0.0f; // reference heading
+uint32_t g_obs_timer_start = 0;  // timer for blind moves
+
+// --- barcode shared globals ---
+char g_last_barcode_cmd[32] = {0};
+volatile bool g_barcode_received = false; 
+char g_last_barcode_payload[60] = "";
 
 static MQTT_CLIENT_DATA_T mqtt_state;
-
-// --- HELPER FUNCTIONS ---
-
+// --- adc helper (thread safe) ---
 uint16_t ir_read_single_sensor_raw_local(void) {
     taskENTER_CRITICAL();
     adc_select_input(PIN_IR_RIGHT_ADC_CH);
@@ -82,140 +102,437 @@ uint16_t ir_read_single_sensor_raw_local(void) {
     return val;
 }
 
-void gpio_interrupt_handler(uint gpio, uint32_t events) {
-    uint32_t now = to_ms_since_boot(get_absolute_time());
-    if (now - last_button_press_time < 300) return;
-    last_button_press_time = now;
-    if (gpio == BUTTON_MODE_CALIB_START) g_btn_action_flag = true;
+// --- imu helper (thread safe) ---
+// Prevents collision between main task and ultrasonic task using I2C
+float imu_get_heading_safe(void) {
+    taskENTER_CRITICAL();
+    float h = imu_get_heading();
+    taskEXIT_CRITICAL();
+    return h;
 }
 
-// --- Main Control Task ---
-void main_control_task(__unused void *params) {
-    vTaskDelay(pdMS_TO_TICKS(500));
-    printf("Starting ADAPTIVE STABILITY Mode with ULTRASONIC SCAN.\n");
+// --- imu helper ---
+float get_angle_diff(float target, float current) {
+    float diff = target - current;
+    while (diff > 180.0f) diff -= 360.0f;
+    while (diff < -180.0f) diff += 360.0f;
+    return diff;
+}
 
-    ir_set_tuning_params(45.0f, 0.0f, 7.0f, 65.0f, 1.0f, 0.5f, 1.0f, 0.4f);
-    float base_speed = 38.0f;
+// --- helper: normalizes angle to 0-360 ---
+float norm_angle(float angle) {
+    while (angle < 0) angle += 360.0f;
+    while (angle >= 360) angle -= 360.0f;
+    return angle;
+}
 
-    int32_t delta_left = 0;
-    int32_t delta_right = 0;
+// --- helper: execute turn to heading ---
+bool perform_turn_step(float target_heading) {
+    float current_yaw = imu_get_heading_safe();
+    float error = get_angle_diff(target_heading, current_yaw);
 
-    // Static variables for Ultrasonic timing
-    static uint32_t last_us_check_time = 0;
+    // 1. TIGHTER TOLERANCE CHECK
+    // If we are within 2.0 degrees, we consider it done.
+    if (fabs(error) < 1.8f) {
+        motor_set_speed(MOTOR_LEFT, 0);
+        motor_set_speed(MOTOR_RIGHT, 0);
+        return true;
+    }
+
+    float kp = (fabs(error) > 10.0f) ? 3.5f : 2.0f;
+
+    // 2. INCREASED P-GAIN (Was 2.8f)
+    // Makes the robot correct more aggressively for small errors
+    float turn_speed = error * kp; 
+
+    // 3. INCREASED STICTION BOOST (The Fix)
+    // Was 22.0f. We raise it to 28.0f to ensure the robot can physically 
+    // move when the error is small (e.g., 2.5 degrees).
+    // If it still sticks, increase this to 30.0f.
+    float min_speed = 28.0f;
+
+    // Apply limits and boost
+    if (turn_speed > 0) {
+        if (turn_speed < min_speed) turn_speed = min_speed;
+        if (turn_speed > 50.0f) turn_speed = 50.0f; // Slight bump to max speed too
+    } else {
+        if (turn_speed > -min_speed) turn_speed = -min_speed;
+        if (turn_speed < -50.0f) turn_speed = -50.0f;
+    }
+
+    motor_set_speed(MOTOR_LEFT, turn_speed);
+    motor_set_speed(MOTOR_RIGHT, -turn_speed);
+    
+    // Indicator: Purple while turning
+    update_leds(50, 0, 50, 50, 0, 50); 
+
+    return false;
+}
+
+// --- helper: drive straight with heading hold ---
+bool perform_drive_step(float target_heading, uint32_t duration_ms) {
+    uint32_t now = to_ms_since_boot(get_absolute_time());
+    
+    if (now - g_obs_timer_start > duration_ms) {
+        motor_set_speed(MOTOR_LEFT, 0);
+        motor_set_speed(MOTOR_RIGHT, 0);
+        return true; 
+    }
+
+    float current_yaw = imu_get_heading_safe();
+    float error = get_angle_diff(target_heading, current_yaw);
+    
+    // gyro correction
+    float correction = error * 1.5f; 
+    float forward_speed = 35.0f; 
+
+    motor_set_speed(MOTOR_LEFT, forward_speed + correction);
+    motor_set_speed(MOTOR_RIGHT, forward_speed - correction);
+    
+    update_leds(50, 50, 0, 50, 50, 0); // yellow indicator
+    return false;
+}
+
+// --- helper: perform arc turn ---
+bool perform_arc_step(float target_heading, float inner_wheel_ratio, int direction) {
+    float current_yaw = imu_get_heading_safe();
+    float error = get_angle_diff(target_heading, current_yaw);
+
+    // Base speed for the outer wheel (Main movement speed)
+    float outer_speed = 45.0f; 
+    float inner_speed = outer_speed * inner_wheel_ratio;
+
+    // Determine which wheel is inner/outer based on turn direction
+    float left_speed, right_speed;
+
+    // If we need to turn LEFT (direction -1), Left wheel is Inner
+    if (direction == -1) {
+        left_speed = inner_speed;
+        right_speed = outer_speed;
+    } 
+    // If we need to turn RIGHT (direction 1), Right wheel is Inner
+    else {
+        left_speed = outer_speed;
+        right_speed = inner_speed;
+    }
+
+    // Apply to motors
+    motor_set_speed(MOTOR_LEFT, left_speed);
+    motor_set_speed(MOTOR_RIGHT, right_speed);
+    
+    // Indicators (Cyan for smooth arc)
+    update_leds(0, 50, 50, 0, 50, 50); 
+
+    // Completion Check (Wider window for smooth motion)
+    // As soon as we pass the target or get very close, we stop/transition
+    if (fabs(error) < 5.0f) {
+        return true;
+    }
+    return false;
+}
+
+// --- master isr for buttons ---
+void gpio_interrupt_handler(uint gpio, uint32_t events) {
+    // 1. Handle Encoders FIRST (High speed, no debounce needed)
+    // We pass the event to the driver to check if the pin matches
+    encoder_handle_interrupt(gpio, events);
+
+    // 2. Handle Buttons (Low speed, needs debounce)
+    if (gpio == BUTTON_MODE_CALIBRATE || gpio == BUTTON_MODE_START_STOP) {
+        
+        uint32_t now = to_ms_since_boot(get_absolute_time());
+        
+        // Check debounce only for buttons
+        if (now - last_button_press_time > 200) { 
+            last_button_press_time = now;
+
+            if (gpio == BUTTON_MODE_CALIBRATE) {
+                g_btn_calibrate_flag = true;
+            } 
+            else if (gpio == BUTTON_MODE_START_STOP) {
+                g_btn_start_stop_flag = true;
+            }
+        }
+    }
+}
+
+// --- NEW TASK: ULTRASONIC TASK ---
+void ultrasonic_task(__unused void *params) {
+    set_servo_angle(CENTER_ANGLE);
+    
+    // Counter for consecutive valid detections
+    int detection_counter = 0;
+    const int REQUIRED_DETECTIONS = 2; // Must see obstacle 2 times in a row
 
     for (;;) {
-        // Handle Button
-        if (g_btn_action_flag) {
-            g_btn_action_flag = false;
-            if (!g_is_calibrated) {
-                if (current_state == STATIONARY_NOT_CALIBRATED) current_state = CALIBRATE_WHITE_SAMPLING;
-                else if (current_state == CALIBRATE_BLACK_WAIT) current_state = CALIBRATE_BLACK_SAMPLING;
+        if (g_is_running && g_maneuver_state == 0) {
+            
+            // 1. INCREASE SAMPLES: Take 3 samples to filter out random electrical spikes
+            float dist = get_median_distance(3); 
+            
+            // Only update global if valid
+            if (dist > 0.1f) distance_to_obstacle_cm = dist;
+
+            // 2. CHECK RANGE
+            if (distance_to_obstacle_cm < 17.0f && distance_to_obstacle_cm > 4.0f) {
+                detection_counter++;
             } else {
-                g_is_running = !g_is_running;
-                if (!g_is_running) {
-                    update_leds(50, 0, 0, 50, 0, 0);
-                } else {
-                    ir_reset_pid_state();
-                    encoder_reset_total_ticks();
-                    update_leds(0, 50, 0, 0, 50, 0);
-                    // Reset Maneuver state on restart
-                    g_maneuver_state = 0;
-                    g_obs_step = 0;
-                    g_last_known_dist = 100.0f;
-                    vTaskDelay(pdMS_TO_TICKS(500));
-                }
+                detection_counter = 0; // Reset if we see "infinity" or safe distance
+            }
+
+            // 3. TRIGGER ONLY AFTER CONFIRMATION
+            if (detection_counter >= REQUIRED_DETECTIONS) {
+                
+                // Reset counter
+                detection_counter = 0;
+
+                // --- ORIGINAL MANEUVER LOGIC STARTS HERE ---
+                g_maneuver_state = 3; 
+                vTaskDelay(pdMS_TO_TICKS(500)); 
+                g_measured_width = perform_full_scan_routine(distance_to_obstacle_cm);
+                g_obs_dir = -1;
+                g_obs_base_heading = imu_get_heading_safe();
+                g_obs_step = 1;
+                g_maneuver_state = 1; 
+                distance_to_obstacle_cm = 100.0f;
+            }
+        }
+        
+        // Run at 20Hz (every 50ms)
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+}
+
+// --- main control task ---
+void main_control_task(__unused void *params) {
+    vTaskDelay(pdMS_TO_TICKS(500));
+    printf("control task started.\n");
+    
+    set_servo_angle(CENTER_ANGLE);
+
+    // ensure barcode calibration runs only once per calibration cycle
+    static bool barcode_cal_done = false;
+    ir_set_tuning_params(45.0f, 0.0f, 7.0f, 65.0f, 1.0f, 0.5f, 1.0f, 0.4f);
+
+    // Timer for speed calculation
+    uint32_t last_speed_update = 0;
+
+    for (;;) {
+        uint32_t now = to_ms_since_boot(get_absolute_time());
+        // --- 1. UPDATE ENCODER DATA (Run every 100ms) ---
+        if (now - last_speed_update >= 100) {
+            last_speed_update = now;
+            
+            // Calculate and update globals
+            g_current_speed_cms = encoder_calculate_speed_cms();
+            g_total_distance_cm = encoder_get_distance_cm();
+        }
+        
+        imu_get_heading_safe();
+        
+        // --- handle calibration button ---
+        if (g_btn_calibrate_flag) {
+            g_btn_calibrate_flag = false;
+            if (current_state == STATIONARY_NOT_CALIBRATED) {
+                current_state = CALIBRATE_WHITE_SAMPLING;
+            } else if (current_state == CALIBRATE_BLACK_WAIT) {
+                current_state = CALIBRATE_BLACK_SAMPLING;
+            } else if (current_state == CALIBRATED_STOPPED) {
+                current_state = STATIONARY_NOT_CALIBRATED;
+                g_is_calibrated = false;
+                g_is_running = false;
+
+                // allow barcode recalibration next time
+                barcode_cal_done = false;
             }
         }
 
+        // --- handle start/stop button ---
+        if (g_btn_start_stop_flag) {
+            g_btn_start_stop_flag = false;
+            if (g_is_calibrated) {
+                g_is_running = !g_is_running;
+                if (!g_is_running) {
+                    g_maneuver_state = 0;
+                    g_obs_step = 0;
+                }
+            } else {
+                update_leds(50, 0, 0, 50, 0, 0); 
+                vTaskDelay(pdMS_TO_TICKS(200));
+            }
+        }
+
+        // --- state machine ---
         switch (current_state) {
             case STATIONARY_NOT_CALIBRATED:
-                update_leds(20, 0, 0, 20, 0, 0); motor_set_speed(MOTOR_LEFT, 0); motor_set_speed(MOTOR_RIGHT, 0); break;
+                update_leds(20, 0, 0, 20, 0, 0);
+                motor_set_speed(MOTOR_LEFT, 0); 
+                motor_set_speed(MOTOR_RIGHT, 0);
+                break;
 
             case CALIBRATE_WHITE_SAMPLING: {
                 uint64_t sum = 0;
-                for(int i=0; i<10; i++) { sum += ir_read_single_sensor_raw_local(); update_leds(50, 50, 50, 50, 50, 50); vTaskDelay(50); update_leds(0,0,0,0,0,0); vTaskDelay(50); }
-                g_calib_white = (uint16_t)(sum / 10); current_state = CALIBRATE_BLACK_WAIT; update_leds(0, 50, 0, 0, 50, 0); break; }
+                for(int i=0; i<10; i++) {
+                    sum += ir_read_single_sensor_raw_local();
+                    update_leds(50, 50, 50, 50, 50, 50); vTaskDelay(pdMS_TO_TICKS(50)); 
+                    update_leds(0, 0, 0, 0, 0, 0);       vTaskDelay(pdMS_TO_TICKS(50)); 
+                }
+                g_calib_white = (uint16_t)(sum / 50);
+                current_state = CALIBRATE_BLACK_WAIT;
+                update_leds(0, 50, 0, 0, 50, 0);
+                break;
+            }
 
-            case CALIBRATE_BLACK_WAIT: update_leds(0, 50, 0, 0, 50, 0); break;
+            case CALIBRATE_BLACK_WAIT:
+                update_leds(0, 50, 0, 0, 50, 0);
+                break;
 
             case CALIBRATE_BLACK_SAMPLING: {
                 uint64_t sum = 0;
-                for(int i=0; i<10; i++) { sum += ir_read_single_sensor_raw_local(); update_leds(0, 0, 50, 0, 0, 50); vTaskDelay(50); update_leds(0,0,0,0,0,0); vTaskDelay(50); }
-                g_calib_black = (uint16_t)(sum / 10); ir_set_calibration_values(g_calib_white, g_calib_black);
-                g_is_calibrated = true; current_state = CALIBRATED_STOPPED; update_leds(0, 50, 0, 0, 50, 0); vTaskDelay(200); break; }
+                for(int i=0; i<10; i++) {
+                    sum += ir_read_single_sensor_raw_local();
+                    update_leds(0, 0, 50, 0, 0, 50); vTaskDelay(pdMS_TO_TICKS(50)); 
+                    update_leds(0, 0, 0, 0, 0, 0);   vTaskDelay(pdMS_TO_TICKS(50)); 
+                }
+                g_calib_black = (uint16_t)(sum / 50);
+                ir_set_calibration_values(150, 900);
+                g_is_calibrated = true;
+                current_state = CALIBRATED_STOPPED;
+
+                update_leds(0, 50, 0, 0, 50, 0); 
+                vTaskDelay(pdMS_TO_TICKS(1000));
+                break;
+            }
 
             case CALIBRATED_STOPPED:
-                if (g_is_running) {
-                    
-                    if (g_maneuver_state == 0) {
-                        // --- 1. ULTRASONIC DETECTION ---
-                        // Only run detection if we are in Line Follow mode (state 0)
+                if (g_is_running) { 
+                    // --- barcode command check ---
+                    // only check if no maneuver active
+                    if (g_barcode_received && g_maneuver_state == 0) {
+                        g_obs_base_heading = imu_get_heading_safe();
                         
-                        uint32_t now_us = to_ms_since_boot(get_absolute_time());
-                        if (now_us - last_us_check_time > 100) {
-                            last_us_check_time = now_us;
-                            float d = get_median_distance(1);
-                            if (d > 0.1f) g_last_known_dist = d;
+                        if (strcmp(g_last_barcode_cmd, "LEFT") == 0) {
+                            g_obs_dir = -1;
+                            g_maneuver_state = 2; // 2 = intersection mode
+                        } 
+                        else if (strcmp(g_last_barcode_cmd, "RIGHT") == 0) {
+                            g_obs_dir = 1;
+                            g_maneuver_state = 2;
                         }
+                        g_barcode_received = false; 
+                    }
 
-                        // Obstacle detected in close range
-                        if (g_last_known_dist < 23.0f && g_last_known_dist > 2.0f) {
-                            printf("Obstacle detected at %.1f cm! Stopping and Scanning...\n", g_last_known_dist);
-                            
-                            // stop motors
-                            motor_set_speed(MOTOR_LEFT, 0);
-                            motor_set_speed(MOTOR_RIGHT, 0);
-                            update_leds(50, 0, 0, 50, 0, 0); // Red LEDs
-
-                            // perform scan (Blocking)
-                            vTaskDelay(pdMS_TO_TICKS(500));
-                            g_measured_width = perform_full_scan_routine(g_last_known_dist);
-                            printf("Scan complete. Width: %.2f cm\n", g_measured_width);
-
-                            // init avoidance maneuver state
-                            g_obs_base_heading = imu_get_heading();
-                            g_maneuver_state = 1; // 1 = obstacle mode
-                            g_obs_step = 1;       // start sequence
-                            g_last_known_dist = 100.0f; // reset so we don't loop immediately
-                        }
-
-                        // --- 2. LINE FOLLOWER ---
-                        // Only drive if we didn't just switch to obstacle mode
-                        if (g_maneuver_state == 0) {
-                            update_leds(0, 50, 50, 0, 50, 50); // Cyan
-
-                            ir_follow_line_single(base_speed,
-                                                  &g_target_power_left, &g_target_power_right, &g_sensor_R,
-                                                  &g_current_ir_state, &g_current_lost_time_ms);
-
-                            encoder_update_and_get_ticks(&delta_left, &delta_right);
-
-                            if (strncmp(g_current_ir_state, "STRT", 4) == 0) {
-                                int32_t diff = delta_left - delta_right;
-                                float correction = diff * 0.3f;
-                                g_target_power_left -= correction;
-                                g_target_power_right += correction;
-                            }
-
-                            motor_set_speed(MOTOR_LEFT, g_target_power_left);
-                            motor_set_speed(MOTOR_RIGHT, g_target_power_right);
-                        }
-                    } 
-                    else if (g_maneuver_state == 1) {
-                        // --- 3. OBSTACLE STOPPED STATE ---
-                        // The car has scanned and is now waiting.
-                        // Since we just want to stop, we force motors to 0 here.
+                    // --- execute maneuver logic ---
+                    if (g_maneuver_state == 3) {
+                        // scanning state - motors off
                         motor_set_speed(MOTOR_LEFT, 0);
                         motor_set_speed(MOTOR_RIGHT, 0);
-                        update_leds(50, 0, 0, 50, 0, 0); // Remain Red
+                        update_leds(50, 0, 0, 50, 0, 0); // Red LEDs
+                    }
+                    // --- execute maneuver logic (OBSTACLE AVOIDANCE) ---
+                    else if (g_maneuver_state == 1) {
+                        float target = 0;
+                        
+                        // Setup clearance time based on measured width
+                        // This determines how long we drive PARALLEL to the obstacle
+                        // uint32_t clearance_time = (uint32_t)(g_measured_width * 45.0f); // Tweak multiplier as needed
+                        // if (clearance_time < 1000) clearance_time = 1000; // Minimum box length
+                        uint32_t clearance_time = 3700;
+
+                        // Fixed time to drive AWAY from and BACK TO the track (depth of the box)
+                        uint32_t depth_time = 2200; 
+
+                        switch (g_obs_step) {
+                            // --- STEP 1: TURN OUT (90 deg) ---
+                            case 1: 
+                                target = norm_angle(g_obs_base_heading + (g_obs_dir * 75.0f));
+                                if (perform_turn_step(target)) {
+                                    // Turn complete. Reset timer for the next Drive step.
+                                    vTaskDelay(pdMS_TO_TICKS(200)); // Brief pause for stability
+                                    g_obs_timer_start = to_ms_since_boot(get_absolute_time());
+                                    g_obs_step++;
+                                }
+                                break;
+                            // --- STEP 2: DRIVE OUT (Create depth) ---
+                            case 2: 
+                                target = norm_angle(g_obs_base_heading + (g_obs_dir * 75.0f));
+                                if (perform_drive_step(target, depth_time)) {
+                                    g_obs_step++;
+                                }
+                                break;
+                            // --- STEP 3: TURN PARALLEL (Face 0 deg relative to base) ---
+                            case 3: 
+                                target = norm_angle(g_obs_base_heading);
+                                if (perform_turn_step(target)) {
+                                    vTaskDelay(pdMS_TO_TICKS(200));
+                                    g_obs_timer_start = to_ms_since_boot(get_absolute_time());
+                                    g_obs_step++;
+                                }
+                                break;
+                            // --- STEP 4: DRIVE PARALLEL (Clear the width) ---
+                            case 4: 
+                                target = norm_angle(g_obs_base_heading);
+                                if (perform_drive_step(target, clearance_time)) {
+                                    g_obs_step++;
+                                }
+                                break;
+                            // --- STEP 5: TURN IN (Face towards track) ---
+                            // If we dodged Left (-1), we need to turn Right (+90 relative to base) to face track.
+                            case 5: 
+                                target = norm_angle(g_obs_base_heading - (g_obs_dir * 75.0f));
+                                if (perform_turn_step(target)) {
+                                    vTaskDelay(pdMS_TO_TICKS(200));
+                                    g_obs_timer_start = to_ms_since_boot(get_absolute_time());
+                                    g_obs_step++;
+                                }
+                                break;
+                            // --- STEP 6: DRIVE IN (Return to line) ---
+                            case 6: 
+                                target = norm_angle(g_obs_base_heading - (g_obs_dir * 75.0f));
+                                if (perform_drive_step(target, depth_time + 200)) {
+                                    g_obs_step++;
+                                }
+                                break;
+                            // --- STEP 7: ALIGN (Face Forward) ---
+                            case 7: 
+                                target = norm_angle(g_obs_base_heading);
+                                if (perform_turn_step(target)) {
+                                    printf("OBSTACLE: Box Maneuver Complete.\n");
+                                    ir_reset_pid_state(); 
+                                    g_maneuver_state = 0; 
+                                    g_obs_step = 0;
+                                }
+                                break;
+                        }
+                    }
+                    else if (g_maneuver_state == 2) {
+                        // --- intersection turn sequence (simple 90 degree) ---
+                        float target = norm_angle(g_obs_base_heading + (g_obs_dir * 90.0f));
+                        if (perform_turn_step(target)) {
+                            // drive forward briefly to clear intersection
+                            motor_set_speed(MOTOR_LEFT, 35);
+                            motor_set_speed(MOTOR_RIGHT, 35);
+                            vTaskDelay(pdMS_TO_TICKS(300));
+                            
+                            ir_reset_pid_state();
+                            g_maneuver_state = 0; // complete
+                        }
+                    } 
+                    else {
+                        // --- normal line following ---
+                        ir_follow_line_single(g_line_follow_power, &g_target_power_left, &g_target_power_right, &g_sensor_R, &g_current_ir_state, &g_current_lost_time_ms);
+                        motor_set_speed(MOTOR_LEFT, g_target_power_left);
+                        motor_set_speed(MOTOR_RIGHT, g_target_power_right);
+                        
+                        float steer = g_target_power_left - g_target_power_right;
+                        handle_smart_indicators(steer);
                     }
 
                 } else {
-                    // Not Running
-                    ir_set_calibration_values(150, 900);
-                    motor_set_speed(MOTOR_LEFT, 0); motor_set_speed(MOTOR_RIGHT, 0);
-                    if ((to_ms_since_boot(get_absolute_time()) % 1000) < 500) update_leds(0,50,50,0,50,50);
-                    else update_leds(0,0,0,0,0,0);
+                    // stopped state
+                    motor_set_speed(MOTOR_LEFT, 0); 
+                    motor_set_speed(MOTOR_RIGHT, 0);
+                    update_leds(0, 0, 20, 0, 0, 20);
                 }
                 break;
         }
@@ -223,7 +540,7 @@ void main_control_task(__unused void *params) {
     }
 }
 
-// --- Barcode Task ---
+// --- barcode task (high priority) ---
 void barcode_task(__unused void *params) {
     // background scanner that fills globals for main_control_task
     vTaskDelay(pdMS_TO_TICKS(1000));
@@ -232,72 +549,136 @@ void barcode_task(__unused void *params) {
     static char prev_payload[60] = "";
 
     for (;;) {
-        barcode_step_300hz();
-        run_t r;
-        while (barcode_get_next_run(&r)) {}
+        // ensure ADC is on barcode channel before stepping
+        taskENTER_CRITICAL();
+        adc_select_input(BARCODE_ADC_CH); // ADC1 for GP27
+        taskEXIT_CRITICAL();
 
-        const char *cmd = barcode_last_command();
-        if (cmd && cmd[0] != '\0' && strcmp(cmd, "NONE") != 0) {
-            if (strcmp(cmd, "LEFT") == 0 || strcmp(cmd, "RIGHT") == 0) {
-                if (g_is_running) {
-                    printf("!!! BARCODE DETECTED: %s -> STOPPING CAR !!!\n", cmd);
-                    g_is_running = false;
-                    motor_set_speed(MOTOR_LEFT, 0);
-                    motor_set_speed(MOTOR_RIGHT, 0);
-                    update_leds(50, 0, 0, 50, 0, 0);
-                    ir_reset_pid_state();
-                    g_target_power_left = 0;
-                    g_target_power_right = 0;
-                }
+        // sampling at BARCODE_SAMPLE_HZ ensures accurate code39 detection
+        barcode_step_300hz(); 
+
+        // Get latest decoded data from barcode.c
+        const char *p = barcode_last_payload();    // e.g. "Z"
+        const char *c = barcode_last_command();    // e.g. "LEFT"
+        const char *s = barcode_last_symbols();    // e.g. "*Z*"
+
+        // new decode when payload changes (non-empty)
+        if (p && p[0] && strcmp(prev_payload, p) != 0) {
+            // ---- PRINT FROM MAIN (what you want) ----
+            if (s && s[0]) {
+                printf("[MAIN] SYMS: %s\n", s);
             }
-            barcode_clear_result();
+            printf("[MAIN] Decoded: %s\n", p);
+            printf("[MAIN] Command: %s\n", (c && c[0]) ? c : "NONE");
+
+            // keep a copy so we only react once per scan
+            strncpy(prev_payload, p, sizeof(prev_payload) - 1);
+            prev_payload[sizeof(prev_payload) - 1] = '\0';
+
+            // ---- UPDATE GLOBALS FOR OTHER TASKS + MQTT ----
+            strncpy(g_last_barcode_payload, p, sizeof(g_last_barcode_payload) - 1);
+            g_last_barcode_payload[sizeof(g_last_barcode_payload) - 1] = '\0';
+
+            if (c && c[0]) {
+                strncpy(g_last_barcode_cmd, c, sizeof(g_last_barcode_cmd) - 1);
+                g_last_barcode_cmd[sizeof(g_last_barcode_cmd) - 1] = '\0';
+            } else {
+                strcpy(g_last_barcode_cmd, "NONE");
+            }
+
+            g_barcode_received = true;
+
+            // optional summary line
+            printf("[BC] Payload=%s | Cmd=%s\n",
+                   g_last_barcode_payload, g_last_barcode_cmd);
         }
+
+        vTaskDelay(pdMS_TO_TICKS(1)); // yield to other tasks
     }
+
 }
 
-void network_task(__unused void *params) {
+// --- network task ---
+void network_task(__unused void *params) {   
     if (cyw43_arch_init()) return;
     mqtt_client_init(&mqtt_state);
-    while (!mqtt_client_try_wifi_connect(&mqtt_state, 10000)) { vTaskDelay(2000); }
+    while (!mqtt_client_try_wifi_connect(&mqtt_state, 10000)) { vTaskDelay(pdMS_TO_TICKS(2000)); }
     mqtt_client_start_mqtt(&mqtt_state);
+    
     uint32_t last_pub = 0;
+
+    encoder_reset_total_ticks();
     for (;;) {
-        mqtt_client_poll(&mqtt_state);
+        mqtt_client_poll(&mqtt_state); 
         uint32_t now = to_ms_since_boot(get_absolute_time());
+        
         if (mqtt_client_is_online(&mqtt_state) && (now - last_pub >= TELEMETRY_PUBLISH_INTERVAL_MS)) {
             last_pub = now;
-            int32_t ticks_l = encoder_get_total_ticks_left();
-            int32_t ticks_r = encoder_get_total_ticks_right();
 
-            // Correctly uses the global variable g_last_known_dist
-            mqtt_pub_telemetry(&mqtt_state, (g_is_running ? 1 : 0), g_current_ir_state, g_target_power_left, g_target_power_right,
-                               ticks_l, ticks_r, g_sensor_R, g_current_lost_time_ms, g_last_known_dist);
-            mqtt_pub_imu_filtered(&mqtt_state, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
+            float speed_cms = encoder_calculate_speed_cms();
+            float dist_cm = encoder_get_distance_cm();
+            
+            // publish fusion telemetry
+            mqtt_pub_telemetry(&mqtt_state,
+                (g_is_running ? 1 : 0), 
+                g_current_ir_state,
+                g_target_power_left, g_target_power_right,
+                encoder_get_left_ticks(), encoder_get_right_ticks(),
+                g_sensor_R, g_current_lost_time_ms, 
+                speed_cms, dist_cm); 
+
+            // publish imu specific data
+            mqtt_pub_imu_filtered(
+                &mqtt_state, filtered_accel[0], filtered_accel[1], filtered_accel[2],
+                roll_deg, pitch_deg, yaw_deg
+            );
+
+            mqtt_pub_obstacle(&mqtt_state, distance_to_obstacle_cm, g_measured_width);
+
+            mqtt_pub_barcode(&mqtt_state, g_last_barcode_cmd, g_last_barcode_payload);
         }
-        vTaskDelay(100);
+        vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
 
+// --- launch sequence ---
 void vLaunch(void) {
-    adc_init(); adc_gpio_init(PIN_IR_RIGHT_ADC_GPIO); adc_select_input(PIN_IR_RIGHT_ADC_CH);
+    // 1. init hardware
+    adc_init();
+    adc_gpio_init(PIN_IR_RIGHT_ADC_GPIO);
+    adc_select_input(PIN_IR_RIGHT_ADC_CH);
+    
+    // 2. init drivers
     led_init(); 
-    motor_init(); 
-    ir_init(); 
-    encoder_init();
+    motor_init();
+    ir_init();       
+    encoder_init(); 
+    ultrasonic_init(TRIG_PIN, ECHO_PIN, SERVO_PIN);
     barcode_init();
     imu_init();
 
-    // Initialize Ultrasonic & Servo
-    ultrasonic_init(TRIG_PIN, ECHO_PIN, SERVO_PIN);
+    // barcode_calibrate();
+    
+    // 3. init buttons
+    gpio_init(BUTTON_MODE_CALIBRATE); gpio_set_dir(BUTTON_MODE_CALIBRATE, GPIO_IN); gpio_pull_up(BUTTON_MODE_CALIBRATE);
+    gpio_init(BUTTON_MODE_START_STOP); gpio_set_dir(BUTTON_MODE_START_STOP, GPIO_IN); gpio_pull_up(BUTTON_MODE_START_STOP);
 
-    gpio_init(BUTTON_MODE_CALIB_START); gpio_set_dir(BUTTON_MODE_CALIB_START, GPIO_IN); gpio_pull_up(BUTTON_MODE_CALIB_START);
-    gpio_set_irq_enabled_with_callback(BUTTON_MODE_CALIB_START, GPIO_IRQ_EDGE_FALL, true, &gpio_interrupt_handler);
-
+    gpio_set_irq_enabled_with_callback(BUTTON_MODE_CALIBRATE, GPIO_IRQ_EDGE_FALL, true, &gpio_interrupt_handler);
+    gpio_set_irq_enabled(BUTTON_MODE_START_STOP, GPIO_IRQ_EDGE_FALL, true);
+    
+    // 4. start tasks
     xTaskCreate(network_task, "NetworkTask", 2048, NULL, NETWORK_TASK_PRIORITY, NULL);
     xTaskCreate(main_control_task, "MainTask", 1024, NULL, MAIN_CONTROL_TASK_PRIORITY, NULL);
-    xTaskCreate(barcode_task, "BarcodeTask", 2048, NULL, BARCODE_TASK_PRIORITY, NULL);
+    // xTaskCreate(barcode_task, "BarcodeTask", 2048, NULL, BARCODE_TASK_PRIORITY, NULL);
+    xTaskCreate(ultrasonic_task, "UltrasonicTask", 1024, NULL, ULTRASONIC_TASK_PRIORITY, NULL);
 
     vTaskStartScheduler();
 }
 
-int main() { stdio_init_all(); sleep_ms(3000); vLaunch(); while(1); return 0; }
+int main() {
+    stdio_init_all();
+    sleep_ms(3000); // safety delay for usb
+    vLaunch();
+    while(1);
+    return 0;
+}

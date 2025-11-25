@@ -12,7 +12,7 @@
 #define ACCEL_ADDR 0x19
 #define MAG_ADDR 0x1E
 
-const float ALPHA = 0.2; 
+const float ALPHA = 0.6; 
 
 // Internal Globals
 int16_t raw_accel_data[3];

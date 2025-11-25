@@ -4,6 +4,7 @@
 #include "pico/stdlib.h"
 #include "lwip/apps/mqtt.h"
 #include "ir.h"
+#include "barcode.h"
 
 #ifndef MQTT_TOPIC_LEN
 #define MQTT_TOPIC_LEN 100
@@ -75,7 +76,9 @@ void mqtt_pub_telemetry(MQTT_CLIENT_DATA_T *client_data, int g_current_scenario,
                        int32_t g_total_ticks_left,
                        int32_t g_total_ticks_right,
                        uint16_t g_sensor_R,
-                       uint32_t g_current_lost_time_ms, int turn_direction);
+                       uint32_t g_current_lost_time_ms, float speed, float distance_cm);
+
+void mqtt_pub_barcode(MQTT_CLIENT_DATA_T *client_data, char g_last_barcode_cmd[32], char g_last_barcode_payload[60]);
 /* Publish arbitrary topic/data (wrapper). */
 void mqtt_client_publish(MQTT_CLIENT_DATA_T *client_data, const char *topic, const char *data);
 
@@ -90,5 +93,6 @@ bool mqtt_client_is_online(MQTT_CLIENT_DATA_T *client_data);
 
 extern char g_last_barcode_cmd[32];
 extern volatile bool g_barcode_received;
+extern char g_last_barcode_payload[60];
 
 #endif // MQTT_CLIENT_H

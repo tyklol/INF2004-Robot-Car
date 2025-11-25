@@ -8,38 +8,26 @@
 #define PIN_ENC_L 7 // Left Encoder (GP7)
 #define PIN_ENC_R 0 // Right Encoder (GP0)
 
-/**
- * @brief Initializes the encoder GPIO pins as inputs.
- */
-void encoder_init(void);
+// --- CALIBRATION CONSTANTS (TUNE THESE!) ---
+// Standard yellow motor wheel diameter is ~6.5cm.
+// Encoder disk usually has 20 slots.
+// Circumference = 6.5 * PI = ~20.42 cm
+// CM per Tick = 20.42 / 20 = ~1.02 cm
+#define CM_PER_TICK 1.02f 
 
-/**
- * @brief Resets the total tick counters to zero.
- * Call this when you change state (e.g., from STOPPED to RUNNING).
- */
+void encoder_init(void);
 void encoder_reset_total_ticks(void);
 
-/**
- * @brief Gets the total accumulated ticks for the LEFT encoder.
- * Used for calculating total distance.
- * @return Total ticks since the last reset.
- */
-int32_t encoder_get_total_ticks_left(void);
+// Get raw ticks
+int32_t encoder_get_left_ticks(void);
+int32_t encoder_get_right_ticks(void);
 
-/**
- * @brief Gets the total accumulated ticks for the RIGHT encoder.
- * Used for calculating total distance.
- * @return Total ticks since the last reset.
- */
-int32_t encoder_get_total_ticks_right(void);
+// --- NEW TELEMETRY FUNCTIONS ---
+// Returns total distance averaged between two wheels in cm
+float encoder_get_distance_cm(void);
 
-/**
- * @brief Polls the encoder pins and updates the tick counts.
- * THIS IS THE MAIN NEW FUNCTION. Call it once per control loop.
- *
- * @param delta_ticks_left Pointer to store the ticks counted *since the last call*.
- * @param delta_ticks_right Pointer to store the ticks counted *since the last call*.
- */
-void encoder_update_and_get_ticks(int32_t *delta_ticks_left, int32_t *delta_ticks_right);
+// Returns current speed in cm/s (call this regularly, e.g., every 200ms)
+float encoder_calculate_speed_cms(void);
 
+void encoder_handle_interrupt(uint gpio, uint32_t events);
 #endif // _ENCODER_H_
