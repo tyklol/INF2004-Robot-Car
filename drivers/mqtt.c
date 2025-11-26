@@ -194,12 +194,12 @@ static void mqtt_incoming_data_cb(void *arg, const u8_t *data, u16_t len, u8_t f
         else if (lwip_stricmp((const char *)state->data, "Off") == 0 || strcmp((const char *)state->data, "0") == 0)
             control_led(state, false);
     } else if (strcmp(basic_topic, "/barcode") == 0) {
-        // uint16_t copy_len = (len > 31) ? 31 : len;
-        // memcpy(g_last_barcode_cmd, data, copy_len);
-        // g_last_barcode_cmd[copy_len] = '\0'; // Null terminate
+        uint16_t copy_len = (len > 31) ? 31 : len;
+        memcpy(g_last_barcode_cmd, data, copy_len);
+        g_last_barcode_cmd[copy_len] = '\0'; // Null terminate
         
-        // // 2. Set the flag so main.c knows new data is here
-        // g_barcode_received = true;
+        // 2. Set the flag so main.c knows new data is here
+        g_barcode_received = true;
     } else if (strcmp(basic_topic, "/print") == 0) {
         printf("%.*s\n", len, data);
     } else if (strcmp(basic_topic, "/ping") == 0) {

@@ -128,44 +128,73 @@ float norm_angle(float angle) {
 
 // --- helper: execute turn to heading ---
 bool perform_turn_step(float target_heading) {
+    static bool is_braking = false;
+    static uint32_t brake_start_time = 0;
+    
     float current_yaw = imu_get_heading_safe();
     float error = get_angle_diff(target_heading, current_yaw);
 
-    // 1. TIGHTER TOLERANCE CHECK
-    // If we are within 2.0 degrees, we consider it done.
-    if (fabs(error) < 1.8f) {
-        motor_set_speed(MOTOR_LEFT, 0);
-        motor_set_speed(MOTOR_RIGHT, 0);
-        return true;
+    // RESET LOGIC: If error is huge (start of a new turn), ensure braking is off
+    if (fabs(error) > 10.0f) {
+        is_braking = false;
     }
 
-    float kp = (fabs(error) > 10.0f) ? 3.5f : 2.0f;
+    // --- PHASE 1: BRAKING SEQUENCE ---
+    if (is_braking) {
+        uint32_t now = to_ms_since_boot(get_absolute_time());
+        
+        // Brake for exactly 150ms
+        if (now - brake_start_time > 150) {
+            motor_set_speed(MOTOR_LEFT, 0);
+            motor_set_speed(MOTOR_RIGHT, 0);
+            is_braking = false; // Reset for next time
+            return true;        // Turn Complete
+        }
+        
+        // Apply "Counter-Torque" to stop rotation instantly
+        // If we were turning RIGHT, error was (+), so we need LEFT torque
+        // We just lock motors against the spin
+        motor_set_speed(MOTOR_LEFT, 0);
+        motor_set_speed(MOTOR_RIGHT, 0);
+        // Optional: Active reverse kick if 0 isn't enough:
+        // motor_set_speed(MOTOR_LEFT, -20); motor_set_speed(MOTOR_RIGHT, -20);
+        
+        return false; // Still braking
+    }
 
-    // 2. INCREASED P-GAIN (Was 2.8f)
-    // Makes the robot correct more aggressively for small errors
+    // --- PHASE 2: ARRIVAL CHECK ---
+    // Stop EARLY (at 3 degrees) and let the brake/momentum finish the job
+    if (fabs(error) < 3.0f) {
+        is_braking = true;
+        brake_start_time = to_ms_since_boot(get_absolute_time());
+        
+        // Hard Stop motors immediately to begin braking phase
+        motor_set_speed(MOTOR_LEFT, 0);
+        motor_set_speed(MOTOR_RIGHT, 0);
+        return false;
+    }
+
+    // --- PHASE 3: PID CONTROL ---
+    // Use aggressive P-term since we now have braking to catch us
+    float kp = (fabs(error) > 20.0f) ? 3.5f : 2.5f;
     float turn_speed = error * kp; 
 
-    // 3. INCREASED STICTION BOOST (The Fix)
-    // Was 22.0f. We raise it to 28.0f to ensure the robot can physically 
-    // move when the error is small (e.g., 2.5 degrees).
-    // If it still sticks, increase this to 30.0f.
+    // Stiction Boost
     float min_speed = 28.0f;
+    if (fabs(error) < 8.0f) min_speed = 32.0f; // Boost more when close to overcome static friction
 
-    // Apply limits and boost
     if (turn_speed > 0) {
         if (turn_speed < min_speed) turn_speed = min_speed;
-        if (turn_speed > 50.0f) turn_speed = 50.0f; // Slight bump to max speed too
+        if (turn_speed > 60.0f) turn_speed = 60.0f; 
     } else {
         if (turn_speed > -min_speed) turn_speed = -min_speed;
-        if (turn_speed < -50.0f) turn_speed = -50.0f;
+        if (turn_speed < -60.0f) turn_speed = -60.0f;
     }
 
     motor_set_speed(MOTOR_LEFT, turn_speed);
     motor_set_speed(MOTOR_RIGHT, -turn_speed);
     
-    // Indicator: Purple while turning
     update_leds(50, 0, 50, 50, 0, 50); 
-
     return false;
 }
 
@@ -182,12 +211,30 @@ bool perform_drive_step(float target_heading, uint32_t duration_ms) {
     float current_yaw = imu_get_heading_safe();
     float error = get_angle_diff(target_heading, current_yaw);
     
-    // gyro correction
-    float correction = error * 1.5f; 
-    float forward_speed = 35.0f; 
+    // 1. INCREASED GAIN (Was 1.5f, now 5.0f)
+    // A higher gain forces the robot to react strongly to even 
+    // small deviations (drift), keeping it much straighter.
+    float Kp = 5.0f; 
+    float correction = error * Kp; 
 
-    motor_set_speed(MOTOR_LEFT, forward_speed + correction);
-    motor_set_speed(MOTOR_RIGHT, forward_speed - correction);
+    float forward_speed = 35.0f; 
+    
+    float pwr_left = forward_speed + correction;
+    float pwr_right = forward_speed - correction;
+
+    // 2. ANTI-STALL CLAMP
+    // If we correct too hard, one motor might drop below the stall speed (e.g., 20).
+    // This forces the slower motor to keep moving, ensuring a smooth curve 
+    // rather than a sharp pivot.
+    if (pwr_left < 20.0f) pwr_left = 20.0f;
+    if (pwr_right < 20.0f) pwr_right = 20.0f;
+
+    // 3. MAX SPEED CLAMP (Optional safety)
+    if (pwr_left > 70.0f) pwr_left = 70.0f;
+    if (pwr_right > 70.0f) pwr_right = 70.0f;
+
+    motor_set_speed(MOTOR_LEFT, pwr_left);
+    motor_set_speed(MOTOR_RIGHT, pwr_right);
     
     update_leds(50, 50, 0, 50, 50, 0); // yellow indicator
     return false;
@@ -260,45 +307,57 @@ void gpio_interrupt_handler(uint gpio, uint32_t events) {
 void ultrasonic_task(__unused void *params) {
     set_servo_angle(CENTER_ANGLE);
     
-    // Counter for consecutive valid detections
     int detection_counter = 0;
-    const int REQUIRED_DETECTIONS = 2; // Must see obstacle 2 times in a row
+    const int REQUIRED_DETECTIONS = 2; 
 
     for (;;) {
         if (g_is_running && g_maneuver_state == 0) {
             
-            // 1. INCREASE SAMPLES: Take 3 samples to filter out random electrical spikes
             float dist = get_median_distance(3); 
             
-            // Only update global if valid
             if (dist > 0.1f) distance_to_obstacle_cm = dist;
 
-            // 2. CHECK RANGE
+            // CHECK RANGE (Trigger condition)
             if (distance_to_obstacle_cm < 17.0f && distance_to_obstacle_cm > 4.0f) {
                 detection_counter++;
             } else {
-                detection_counter = 0; // Reset if we see "infinity" or safe distance
+                detection_counter = 0; 
             }
 
-            // 3. TRIGGER ONLY AFTER CONFIRMATION
             if (detection_counter >= REQUIRED_DETECTIONS) {
-                
-                // Reset counter
                 detection_counter = 0;
 
-                // --- ORIGINAL MANEUVER LOGIC STARTS HERE ---
+                // 1. ENTER STOP/SCAN STATE
+                // This stops the motors (handled in main_control_task under case 3)
                 g_maneuver_state = 3; 
+                
+                // 2. WAIT FOR FULL STOP & SCAN
+                // Give it 500ms to physically stop and servo to settle
                 vTaskDelay(pdMS_TO_TICKS(500)); 
+
+                // 3. PERFORM SCAN
                 g_measured_width = perform_full_scan_routine(distance_to_obstacle_cm);
-                g_obs_dir = -1;
+                
+                // 4. *** CRITICAL FIX: WAIT FOR IMU TO SETTLE ***
+                // Now that the scan is done and robot is still, wait 200ms
+                // to let the IMU filter catch up to the stationary position.
+                vTaskDelay(pdMS_TO_TICKS(200));
+
+                // 5. CAPTURE BASE HEADING
+                // This is now accurate because the robot has been still for >2s
                 g_obs_base_heading = imu_get_heading_safe();
+                
+                // 6. SETUP MANEUVER
+                // g_obs_dir = scan_for_clear_path();
+                g_obs_dir = -1; // Default Left for now
                 g_obs_step = 1;
-                g_maneuver_state = 1; 
+                g_maneuver_state = 1; // Start driving
+                
+                // Reset distance so we don't trigger again immediately
                 distance_to_obstacle_cm = 100.0f;
             }
         }
         
-        // Run at 20Hz (every 50ms)
         vTaskDelay(pdMS_TO_TICKS(50));
     }
 }
@@ -395,7 +454,7 @@ void main_control_task(__unused void *params) {
                     update_leds(0, 0, 0, 0, 0, 0);   vTaskDelay(pdMS_TO_TICKS(50)); 
                 }
                 g_calib_black = (uint16_t)(sum / 50);
-                ir_set_calibration_values(150, 900);
+                ir_set_calibration_values(150, 1200);
                 g_is_calibrated = true;
                 current_state = CALIBRATED_STOPPED;
 
@@ -437,15 +496,15 @@ void main_control_task(__unused void *params) {
                         // This determines how long we drive PARALLEL to the obstacle
                         // uint32_t clearance_time = (uint32_t)(g_measured_width * 45.0f); // Tweak multiplier as needed
                         // if (clearance_time < 1000) clearance_time = 1000; // Minimum box length
-                        uint32_t clearance_time = 3700;
+                        uint32_t clearance_time = 3000;
 
                         // Fixed time to drive AWAY from and BACK TO the track (depth of the box)
-                        uint32_t depth_time = 2200; 
+                        uint32_t depth_time = 1800; 
 
                         switch (g_obs_step) {
                             // --- STEP 1: TURN OUT (90 deg) ---
                             case 1: 
-                                target = norm_angle(g_obs_base_heading + (g_obs_dir * 75.0f));
+                                target = norm_angle(g_obs_base_heading + (g_obs_dir * 90.0f));
                                 if (perform_turn_step(target)) {
                                     // Turn complete. Reset timer for the next Drive step.
                                     vTaskDelay(pdMS_TO_TICKS(200)); // Brief pause for stability
@@ -455,7 +514,7 @@ void main_control_task(__unused void *params) {
                                 break;
                             // --- STEP 2: DRIVE OUT (Create depth) ---
                             case 2: 
-                                target = norm_angle(g_obs_base_heading + (g_obs_dir * 75.0f));
+                                target = norm_angle(g_obs_base_heading + (g_obs_dir * 90.0f));
                                 if (perform_drive_step(target, depth_time)) {
                                     g_obs_step++;
                                 }
@@ -479,7 +538,7 @@ void main_control_task(__unused void *params) {
                             // --- STEP 5: TURN IN (Face towards track) ---
                             // If we dodged Left (-1), we need to turn Right (+90 relative to base) to face track.
                             case 5: 
-                                target = norm_angle(g_obs_base_heading - (g_obs_dir * 75.0f));
+                                target = norm_angle(g_obs_base_heading - (g_obs_dir * 90.0f));
                                 if (perform_turn_step(target)) {
                                     vTaskDelay(pdMS_TO_TICKS(200));
                                     g_obs_timer_start = to_ms_since_boot(get_absolute_time());
@@ -488,7 +547,7 @@ void main_control_task(__unused void *params) {
                                 break;
                             // --- STEP 6: DRIVE IN (Return to line) ---
                             case 6: 
-                                target = norm_angle(g_obs_base_heading - (g_obs_dir * 75.0f));
+                                target = norm_angle(g_obs_base_heading - (g_obs_dir * 90.0f));
                                 if (perform_drive_step(target, depth_time + 200)) {
                                     g_obs_step++;
                                 }
